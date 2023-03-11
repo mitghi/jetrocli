@@ -12,9 +12,11 @@ use std::io::{self, Read};
 #[command(about = "Transform, compare and query JSON format")]
 struct Config {
     #[arg(short, long)]
+    #[arg(help = "Jetro query")]
     query: String,
 
     #[arg(short, long)]
+    #[arg(help = "JSON filepath ( or pipe to stdin instead )")]
     file: Option<String>,
 }
 
