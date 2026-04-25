@@ -3,7 +3,8 @@
 mod completion;
 
 use anyhow::{anyhow, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+use std::sync::{Mutex, OnceLock};
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
@@ -18,8 +19,9 @@ use ratatui::{
         Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
     },
 };
+use regex::Regex;
 use serde_json::Value;
-use std::{collections::{HashMap, HashSet}, fs, io, path::PathBuf};
+use std::{collections::{HashMap, HashSet}, fs, io, path::PathBuf, time::Instant};
 use tui_textarea::TextArea;
 
 use completion::{Candidate, CandKind};
@@ -35,7 +37,14 @@ struct Cli {
     /// Pre-fill the expression input.
     #[arg(short, long)]
     expr: Option<String>,
+
+    /// Color theme.
+    #[arg(long, value_enum, default_value_t = ThemeArg::Dark)]
+    theme: ThemeArg,
 }
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum ThemeArg { Dark, Light }
 
 enum Focus { Json, Expr, Result }
 
@@ -55,6 +64,39 @@ struct App<'a> {
     popup_state: ListState,
 
     chord:       Option<char>, // pending prefix key (e.g. Some('c') after C-c)
+
+    last_eval_ns:  u128,
+    last_result_bytes: usize,
+    eval_count:    u64,
+
+    search:      Option<SearchState>,
+    palette:     Option<PaletteState>,
+    help_open:   bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum SearchDir  { Forward, Backward }
+#[derive(Clone, Copy, PartialEq)]
+enum SearchMode { Word, Regex }
+
+struct SearchState {
+    query:        String,
+    direction:    SearchDir,
+    mode:         SearchMode,
+    target:       SearchTarget,
+    failed:       bool,
+    invalid_re:   bool,
+    origin_json:   (usize, usize, usize),
+    origin_result: (usize, usize, usize),
+    origin_expr:   (u16, u16),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum SearchTarget { Json, Result, Expr }
+
+struct PaletteState {
+    query:    String,
+    selected: usize,
 }
 
 impl<'a> App<'a> {
@@ -83,6 +125,12 @@ impl<'a> App<'a> {
             candidates: vec![],
             popup_state: ListState::default(),
             chord: None,
+            search: None,
+            palette: None,
+            help_open: false,
+            last_eval_ns: 0,
+            last_result_bytes: 0,
+            eval_count: 0,
         };
         app.reparse_json();
         app.evaluate();
@@ -106,6 +154,8 @@ impl<'a> App<'a> {
         let expr = self.expr_text();
         if expr.trim().is_empty() {
             self.result_text.clear();
+            self.last_eval_ns = 0;
+            self.last_result_bytes = 0;
             self.sync_result_view();
             return;
         }
@@ -115,9 +165,11 @@ impl<'a> App<'a> {
             } else {
                 self.result_text.clear();
             }
+            self.last_eval_ns = 0;
             self.sync_result_view();
             return;
         };
+        let t0 = Instant::now();
         match jetro::query(&expr, doc) {
             Ok(v)  => {
                 self.result_text = serde_json::to_string_pretty(&v)
@@ -125,6 +177,9 @@ impl<'a> App<'a> {
             }
             Err(e) => self.result_text = format!("error: {}", e),
         }
+        self.last_eval_ns = t0.elapsed().as_nanos();
+        self.last_result_bytes = self.result_text.len();
+        self.eval_count = self.eval_count.saturating_add(1);
         self.sync_result_view();
     }
 
@@ -492,22 +547,129 @@ fn detect_folds(lines: &[String]) -> HashMap<usize, usize> {
 
 // ── UI ───────────────────────────────────────────────────────────────────────
 
-// palette
-const C_ACCENT:   Color = Color::Rgb(0x7a, 0xa2, 0xf7); // soft blue
-const C_ACCENT2:  Color = Color::Rgb(0xbb, 0x9a, 0xf7); // violet
-const C_OK:       Color = Color::Rgb(0x9e, 0xce, 0x6a); // green
-const C_ERR:      Color = Color::Rgb(0xf7, 0x76, 0x8e); // red
-const C_WARN:     Color = Color::Rgb(0xe0, 0xaf, 0x68); // amber
-const C_MUTED:    Color = Color::Rgb(0x56, 0x5f, 0x89);
-const C_STR:      Color = Color::Rgb(0x9e, 0xce, 0x6a);
-const C_KEY:      Color = Color::Rgb(0x7d, 0xcf, 0xff);
-const C_NUM:      Color = Color::Rgb(0xff, 0x9e, 0x64);
-const C_BOOL:     Color = Color::Rgb(0xbb, 0x9a, 0xf7);
-const C_BRACE:    Color = Color::Rgb(0xc0, 0xca, 0xf5);
-const C_PUNCT:    Color = Color::Rgb(0x56, 0x5f, 0x89);
+// palette (theme-driven)
+struct Palette {
+    theme:        ThemeArg,
+    accent:       Color,
+    accent2:      Color,
+    ok:           Color,
+    err:          Color,
+    warn:         Color,
+    muted:        Color,
+    str_:         Color,
+    key:          Color,
+    num:          Color,
+    bool_:        Color,
+    brace:        Color,
+    punct:        Color,
+    body:         Color,
+    hint:         Color,
+    cursor_line:  Color,
+    modeline_bg:  Color,
+    on_chip:      Color,
+    pane_bg:      Color, // overall canvas background
+}
+
+static PALETTE: OnceLock<Mutex<Palette>> = OnceLock::new();
+
+fn pal_color<F: Fn(&Palette) -> Color>(f: F) -> Color {
+    let g = PALETTE.get().expect("palette uninitialized").lock().unwrap();
+    f(&*g)
+}
+fn current_theme() -> ThemeArg {
+    PALETTE.get().expect("palette uninitialized").lock().unwrap().theme
+}
+fn set_palette(theme: ThemeArg) {
+    let p = build_palette(theme);
+    if let Some(slot) = PALETTE.get() {
+        *slot.lock().unwrap() = p;
+    } else {
+        let _ = PALETTE.set(Mutex::new(p));
+    }
+}
+fn toggle_theme() {
+    let new = match current_theme() {
+        ThemeArg::Dark => ThemeArg::Light,
+        ThemeArg::Light => ThemeArg::Dark,
+    };
+    set_palette(new);
+}
+fn init_palette(theme: ThemeArg) { set_palette(theme); }
+
+fn build_palette(theme: ThemeArg) -> Palette {
+    match theme {
+        ThemeArg::Dark => Palette {
+            theme,
+            accent:      Color::Rgb(0x7a, 0xa2, 0xf7),
+            accent2:     Color::Rgb(0xbb, 0x9a, 0xf7),
+            ok:          Color::Rgb(0x9e, 0xce, 0x6a),
+            err:         Color::Rgb(0xf7, 0x76, 0x8e),
+            warn:        Color::Rgb(0xe0, 0xaf, 0x68),
+            muted:       Color::Rgb(0x56, 0x5f, 0x89),
+            str_:        Color::Rgb(0x9e, 0xce, 0x6a),
+            key:         Color::Rgb(0x7d, 0xcf, 0xff),
+            num:         Color::Rgb(0xff, 0x9e, 0x64),
+            bool_:       Color::Rgb(0xbb, 0x9a, 0xf7),
+            brace:       Color::Rgb(0xc0, 0xca, 0xf5),
+            punct:       Color::Rgb(0x56, 0x5f, 0x89),
+            body:        Color::Rgb(0xc0, 0xca, 0xf5),
+            hint:        Color::Rgb(0xa9, 0xb1, 0xd6),
+            cursor_line: Color::Rgb(0x29, 0x2e, 0x42),
+            modeline_bg: Color::Rgb(0x1a, 0x1b, 0x26),
+            on_chip:     Color::Black,
+            pane_bg:     Color::Reset,
+        },
+        ThemeArg::Light => Palette {
+            theme,
+            accent:      Color::Rgb(0x1e, 0x66, 0xf5),  // soft blue
+            accent2:     Color::Rgb(0xfa, 0xa3, 0x4c),  // light orange (was purple)
+            ok:          Color::Rgb(0x40, 0xa0, 0x2b),
+            err:         Color::Rgb(0xd2, 0x0f, 0x39),
+            warn:        Color::Rgb(0xdf, 0x8e, 0x1d),
+            muted:       Color::Rgb(0x9c, 0x90, 0x7a),  // warm gray
+            str_:        Color::Rgb(0x40, 0xa0, 0x2b),
+            key:         Color::Rgb(0x04, 0xa5, 0xe5),
+            num:         Color::Rgb(0xfe, 0x64, 0x0b),
+            bool_:       Color::Rgb(0xfa, 0xa3, 0x4c),
+            brace:       Color::Rgb(0x4c, 0x4a, 0x40),
+            punct:       Color::Rgb(0x9c, 0x90, 0x7a),
+            body:        Color::Rgb(0x4c, 0x4a, 0x40),
+            hint:        Color::Rgb(0x6c, 0x66, 0x55),
+            cursor_line: Color::Rgb(0xf0, 0xe6, 0xc8),  // warmer cream highlight
+            modeline_bg: Color::Rgb(0xf2, 0xe7, 0xc8),  // deeper cream for modeline
+            on_chip:     Color::Rgb(0xfb, 0xf3, 0xde),  // light text on colored chips
+            pane_bg:     Color::Rgb(0xfb, 0xf3, 0xde),  // cream canvas
+        },
+    }
+}
+
+fn c_accent()  -> Color { pal_color(|p| p.accent) }
+fn c_accent2() -> Color { pal_color(|p| p.accent2) }
+fn c_ok()      -> Color { pal_color(|p| p.ok) }
+fn c_err()     -> Color { pal_color(|p| p.err) }
+fn c_warn()    -> Color { pal_color(|p| p.warn) }
+fn c_muted()   -> Color { pal_color(|p| p.muted) }
+fn c_str()     -> Color { pal_color(|p| p.str_) }
+fn c_key()     -> Color { pal_color(|p| p.key) }
+fn c_num()     -> Color { pal_color(|p| p.num) }
+fn c_bool()    -> Color { pal_color(|p| p.bool_) }
+fn c_brace()   -> Color { pal_color(|p| p.brace) }
+fn c_punct()   -> Color { pal_color(|p| p.punct) }
+fn c_body()        -> Color { pal_color(|p| p.body) }
+fn c_hint()        -> Color { pal_color(|p| p.hint) }
+fn c_cursor_line() -> Color { pal_color(|p| p.cursor_line) }
+fn c_modeline_bg() -> Color { pal_color(|p| p.modeline_bg) }
+fn c_pane_bg()     -> Color { pal_color(|p| p.pane_bg) }
+fn c_on_chip()     -> Color { pal_color(|p| p.on_chip) }
 
 fn draw(frame: &mut Frame, app: &mut App) {
     let size = frame.area();
+
+    // canvas background (light theme uses cream; dark uses Reset = terminal default)
+    frame.render_widget(
+        Paragraph::new("").style(Style::default().bg(c_pane_bg())),
+        size,
+    );
 
     let vertical = Layout::vertical([
         Constraint::Length(1),  // header
@@ -526,35 +688,225 @@ fn draw(frame: &mut Frame, app: &mut App) {
     draw_json_pane(frame, top[0], app);
     draw_result_pane(frame, top[1], app);
     draw_expr_pane(frame, vertical[2], app);
-    draw_status(frame, vertical[3], app);
 
+    if app.search.is_some() {
+        draw_search_prompt(frame, vertical[3], app);
+    } else if app.palette.is_some() {
+        draw_palette_prompt(frame, vertical[3], app);
+    } else {
+        draw_status(frame, vertical[3], app);
+    }
+
+    if app.palette.is_some() {
+        draw_palette_list(frame, vertical[2], size, app);
+    }
     if app.popup_open && !app.candidates.is_empty() {
         draw_popup(frame, vertical[2], size, app);
     }
+
+    if app.help_open {
+        draw_help_popup(frame, size);
+    }
+}
+
+fn draw_help_popup(frame: &mut Frame, size: Rect) {
+    let w = 78u16.min(size.width.saturating_sub(4));
+    let h = 28u16.min(size.height.saturating_sub(2));
+    let x = size.x + (size.width.saturating_sub(w)) / 2;
+    let y = size.y + (size.height.saturating_sub(h)) / 2;
+    let area = Rect { x, y, width: w, height: h };
+
+    let key_st  = Style::default().bg(c_warn()).fg(Color::Black).bold();
+    let lbl_st  = Style::default().fg(c_body());
+    let hd_st   = Style::default().fg(c_accent2()).bold();
+    let mt_st   = Style::default().fg(c_muted()).italic();
+
+    let key = |k: &str| Span::styled(format!(" {} ", k), key_st);
+    let lbl = |l: &str| Span::styled(format!("  {}", l), lbl_st);
+    let hd  = |s: &str| Line::from(Span::styled(format!(" {} ", s), hd_st));
+    let row = |k: Vec<Span<'static>>, l: &str| {
+        let mut spans = vec![Span::raw("  ")];
+        spans.extend(k);
+        spans.push(lbl(l));
+        Line::from(spans)
+    };
+
+    let lines: Vec<Line> = vec![
+        Line::from(""),
+        hd("Focus & quit"),
+        row(vec![key("C-o")],            "cycle pane (JSON → expr → result)"),
+        row(vec![key("C-c C-c")],        "quit"),
+        row(vec![key("Esc")],            "quit (when no popup)"),
+        Line::from(""),
+        hd("Edit / motion (JSON & expr)"),
+        row(vec![key("C-f"), key("C-b")],"char forward / back"),
+        row(vec![key("M-f"), key("M-b")],"word forward / back"),
+        row(vec![key("C-n"), key("C-p")],"line down / up"),
+        row(vec![key("C-a"), key("C-e")],"line home / end"),
+        row(vec![key("C-v"), key("M-v")],"page down / up (also M-c)"),
+        row(vec![key("C-k")],            "kill to end of line"),
+        row(vec![key("⏎")],              "newline (expr)"),
+        row(vec![key("S-⏎"), key("M-⏎")],"evaluate expression"),
+        Line::from(""),
+        hd("Folding (JSON / result)"),
+        row(vec![key("C-c f")],          "toggle fold at cursor"),
+        row(vec![key("C-c a")],          "fold all"),
+        row(vec![key("C-c u")],          "unfold all"),
+        Line::from(""),
+        hd("Completion popup (expr)"),
+        row(vec![key("C-␣")],            "open / close popup"),
+        row(vec![key("C-n"), key("C-p")],"navigate"),
+        row(vec![key("⏎"), key("Tab")],  "accept"),
+        row(vec![key("C-g"), key("Esc")],"close"),
+        Line::from(""),
+        hd("Search & commands"),
+        row(vec![key("C-s"), key("C-r")],"isearch forward / backward (repeat to advance)"),
+        row(vec![key("C-w")],            "isearch: word mode"),
+        row(vec![key("M-r")],            "isearch: toggle regex"),
+        row(vec![key("M-x")],            "command palette"),
+        Line::from(""),
+        hd("Buffer ops"),
+        row(vec![key("C-c C-f")],        "format buffer (JSON / expr)"),
+        row(vec![key("C-c C-k")],        "clear buffer"),
+        row(vec![key("C-x C-s")],        "copy buffer to clipboard (OSC 52)"),
+        row(vec![key("C-c h")],          "this help"),
+        Line::from(""),
+        Line::from(Span::styled("  press any key to close",
+            mt_st)),
+    ];
+
+    let title = Line::from(vec![
+        Span::raw(" "),
+        Span::styled("?", Style::default().fg(c_warn()).bold()),
+        Span::raw(" "),
+        Span::styled("help — keybindings", Style::default().fg(c_accent()).bold()),
+        Span::raw(" "),
+    ]);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(c_accent2()))
+        .title(title);
+
+    let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    frame.render_widget(Clear, area);
+    frame.render_widget(para, area);
+}
+
+fn draw_search_prompt(frame: &mut Frame, area: Rect, app: &App) {
+    let s = app.search.as_ref().unwrap();
+    let bg = Style::default().bg(c_modeline_bg());
+    let label_color = if s.failed { c_err() } else { c_accent() };
+    let mode_tag = match s.mode {
+        SearchMode::Word  => " word ",
+        SearchMode::Regex => " regex ",
+    };
+    let dir_label = match s.direction {
+        SearchDir::Forward  => "I-search",
+        SearchDir::Backward => "I-search-bwd",
+    };
+    let status = if s.invalid_re { " ✗ bad regex " }
+        else if s.failed { " ∅ no match " }
+        else { "" };
+
+    let line = Line::from(vec![
+        Span::styled(format!(" {dir_label} "),
+            Style::default().bg(label_color).fg(Color::Black).bold()),
+        Span::styled(mode_tag.to_string(),
+            Style::default().bg(c_accent2()).fg(Color::Black).bold()),
+        Span::raw(" "),
+        Span::styled(s.query.clone(),
+            Style::default().fg(c_body()).bold()),
+        Span::styled("▏", Style::default().fg(c_accent())),
+        Span::styled(status.to_string(), Style::default().fg(c_err()).italic()),
+        Span::raw("   "),
+        Span::styled("C-s/C-r next/prev  C-w word  M-r regex  ⏎ accept  C-g cancel",
+            Style::default().fg(c_muted()).italic()),
+    ]).style(bg);
+    frame.render_widget(Paragraph::new("").style(bg), area);
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+fn draw_palette_prompt(frame: &mut Frame, area: Rect, app: &App) {
+    let p = app.palette.as_ref().unwrap();
+    let bg = Style::default().bg(c_modeline_bg());
+    let line = Line::from(vec![
+        Span::styled(" M-x ",
+            Style::default().bg(c_warn()).fg(Color::Black).bold()),
+        Span::raw(" "),
+        Span::styled(p.query.clone(),
+            Style::default().fg(c_body()).bold()),
+        Span::styled("▏", Style::default().fg(c_accent())),
+        Span::raw("   "),
+        Span::styled("⏎ run  C-n/C-p nav  C-g cancel",
+            Style::default().fg(c_muted()).italic()),
+    ]).style(bg);
+    frame.render_widget(Paragraph::new("").style(bg), area);
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+fn draw_palette_list(frame: &mut Frame, expr_area: Rect, size: Rect, app: &App) {
+    let p = app.palette.as_ref().unwrap();
+    let entries = palette_filtered(&p.query);
+    if entries.is_empty() { return; }
+    let h = (entries.len() as u16 + 2).min(12);
+    let w = 70.min(size.width.saturating_sub(4));
+    let x = expr_area.x + 2;
+    let y = expr_area.y.saturating_sub(h);
+    let area = Rect { x, y, width: w, height: h };
+
+    let items: Vec<ListItem> = entries.iter().enumerate().map(|(i, (_, name, desc))| {
+        let mark = if i == p.selected { "▶ " } else { "  " };
+        ListItem::new(Line::from(vec![
+            Span::styled(mark.to_string(), Style::default().fg(c_accent()).bold()),
+            Span::styled(name.to_string(),  Style::default().fg(Color::Rgb(0xc0,0xca,0xf5)).bold()),
+            Span::raw("  "),
+            Span::styled(desc.to_string(), Style::default().fg(c_muted()).italic()),
+        ]))
+    }).collect();
+
+    let title = Line::from(vec![
+        Span::raw(" "),
+        Span::styled("⌘", Style::default().fg(c_warn())),
+        Span::raw(" "),
+        Span::styled("commands", Style::default().fg(c_accent()).bold()),
+        Span::raw(" "),
+        Span::styled(format!("({})", entries.len()), Style::default().fg(c_muted())),
+        Span::raw(" "),
+    ]);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(c_warn()))
+        .title(title);
+    let list = List::new(items).block(block);
+    frame.render_widget(Clear, area);
+    frame.render_widget(list, area);
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     let mode = match app.focus {
-        Focus::Json   => Span::styled(" JSON ",   Style::default().bg(C_ACCENT).fg(Color::Black).bold()),
-        Focus::Expr   => Span::styled(" EXPR ",   Style::default().bg(C_ACCENT2).fg(Color::Black).bold()),
-        Focus::Result => Span::styled(" RESULT ", Style::default().bg(C_OK).fg(Color::Black).bold()),
+        Focus::Json   => Span::styled(" JSON ",   Style::default().bg(c_accent()).fg(Color::Black).bold()),
+        Focus::Expr   => Span::styled(" EXPR ",   Style::default().bg(c_accent2()).fg(Color::Black).bold()),
+        Focus::Result => Span::styled(" RESULT ", Style::default().bg(c_ok()).fg(Color::Black).bold()),
     };
     let state = if app.parse_err.is_some() {
-        Span::styled(" ● parse error ", Style::default().fg(C_ERR).bold())
+        Span::styled(" ● parse error ", Style::default().fg(c_err()).bold())
     } else if app.result_text.starts_with("error:") {
-        Span::styled(" ● eval error ", Style::default().fg(C_WARN).bold())
+        Span::styled(" ● eval error ", Style::default().fg(c_warn()).bold())
     } else {
-        Span::styled(" ● ready ", Style::default().fg(C_OK).bold())
+        Span::styled(" ● ready ", Style::default().fg(c_ok()).bold())
     };
 
     let title = Line::from(vec![
         Span::raw(" "),
-        Span::styled("✦", Style::default().fg(C_ACCENT2)),
+        Span::styled("✦", Style::default().fg(c_accent2())),
         Span::raw(" "),
-        Span::styled("jetro", Style::default().fg(C_ACCENT).bold()),
-        Span::styled("cli", Style::default().fg(C_ACCENT2).bold()),
+        Span::styled("jetro", Style::default().fg(c_accent()).bold()),
+        Span::styled("cli", Style::default().fg(c_accent2()).bold()),
         Span::raw("  "),
-        Span::styled("interactive jetro REPL", Style::default().fg(C_MUTED).italic()),
+        Span::styled("interactive jetro REPL", Style::default().fg(c_muted()).italic()),
     ]);
 
     let right = Line::from(vec![state, Span::raw(" "), mode, Span::raw(" ")])
@@ -567,8 +919,8 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
 fn draw_json_pane(frame: &mut Frame, area: Rect, app: &mut App) {
     let focused = matches!(app.focus, Focus::Json);
     let (title_icon_color, badge) = match &app.parse_err {
-        Some(_) => (C_ERR, Span::styled(" ✗ parse ", Style::default().bg(C_ERR).fg(Color::Black).bold())),
-        None    => (C_OK,  Span::styled(" ✓ valid ", Style::default().bg(C_OK).fg(Color::Black).bold())),
+        Some(_) => (c_err(), Span::styled(" ✗ parse ", Style::default().bg(c_err()).fg(Color::Black).bold())),
+        None    => (c_ok(),  Span::styled(" ✓ valid ", Style::default().bg(c_ok()).fg(Color::Black).bold())),
     };
 
     let folds_count = detect_folds(&app.json.lines).len();
@@ -576,7 +928,7 @@ fn draw_json_pane(frame: &mut Frame, area: Rect, app: &mut App) {
     let fold_badge = if folds_count > 0 {
         Span::styled(
             format!(" ⋔ {}/{} ", folded_count, folds_count),
-            Style::default().bg(C_ACCENT2).fg(Color::Black).bold(),
+            Style::default().bg(c_accent2()).fg(Color::Black).bold(),
         )
     } else {
         Span::raw("")
@@ -586,7 +938,7 @@ fn draw_json_pane(frame: &mut Frame, area: Rect, app: &mut App) {
         Span::raw(" "),
         Span::styled("◆", Style::default().fg(title_icon_color).bold()),
         Span::raw(" "),
-        Span::styled("JSON input", Style::default().fg(if focused { C_ACCENT } else { C_MUTED }).bold()),
+        Span::styled("JSON input", Style::default().fg(if focused { c_accent() } else { c_muted() }).bold()),
         Span::raw("  "),
         badge,
         Span::raw(" "),
@@ -643,7 +995,7 @@ fn draw_editor(frame: &mut Frame, area: Rect, ed: &mut JsonEditor, block: Block,
         } else { "  " };
         let gutter_span = Span::styled(
             gutter.to_string(),
-            Style::default().fg(if is_fold_header { C_WARN } else { C_MUTED }),
+            Style::default().fg(if is_fold_header { c_warn() } else { c_muted() }),
         );
 
         let mut spans: Vec<Span<'static>> = vec![gutter_span];
@@ -654,19 +1006,19 @@ fn draw_editor(frame: &mut Frame, area: Rect, ed: &mut JsonEditor, block: Block,
                 let inner = e.saturating_sub(row).saturating_sub(1);
                 spans.push(Span::styled(
                     format!("  ⋯ {} lines ", inner + 1),
-                    Style::default().bg(C_MUTED).fg(Color::Black).italic(),
+                    Style::default().bg(c_muted()).fg(Color::Black).italic(),
                 ));
                 let close_trim = ed.lines[e].trim_start();
                 spans.push(Span::styled(
                     format!(" {}", close_trim),
-                    Style::default().fg(C_BRACE).bold(),
+                    Style::default().fg(c_brace()).bold(),
                 ));
             }
         }
 
         let mut line = Line::from(spans);
         if focused && row == ed.row {
-            line = line.style(Style::default().bg(Color::Rgb(0x29, 0x2e, 0x42)));
+            line = line.style(Style::default().bg(c_cursor_line()));
         }
         body.push(line);
     }
@@ -692,11 +1044,11 @@ fn draw_result_pane(frame: &mut Frame, area: Rect, app: &mut App) {
     let focused = matches!(app.focus, Focus::Result);
     let is_err = app.result_text.starts_with("error:") || app.result_text.starts_with("(JSON parse error)");
     let badge = if is_err {
-        Span::styled(" ! error ", Style::default().bg(C_ERR).fg(Color::Black).bold())
+        Span::styled(" ! error ", Style::default().bg(c_err()).fg(Color::Black).bold())
     } else if app.result_text.is_empty() {
-        Span::styled(" ∅ empty ", Style::default().bg(C_MUTED).fg(Color::Black).bold())
+        Span::styled(" ∅ empty ", Style::default().bg(c_muted()).fg(Color::Black).bold())
     } else {
-        Span::styled(" » ok ", Style::default().bg(C_OK).fg(Color::Black).bold())
+        Span::styled(" » ok ", Style::default().bg(c_ok()).fg(Color::Black).bold())
     };
 
     let folds_count = if !is_err && !app.result_text.is_empty() {
@@ -706,15 +1058,15 @@ fn draw_result_pane(frame: &mut Frame, area: Rect, app: &mut App) {
     let fold_badge = if folds_count > 0 {
         Span::styled(
             format!(" ⋔ {}/{} ", folded_count, folds_count),
-            Style::default().bg(C_ACCENT2).fg(Color::Black).bold(),
+            Style::default().bg(c_accent2()).fg(Color::Black).bold(),
         )
     } else { Span::raw("") };
 
     let title = Line::from(vec![
         Span::raw(" "),
-        Span::styled("◈", Style::default().fg(C_ACCENT2).bold()),
+        Span::styled("◈", Style::default().fg(c_accent2()).bold()),
         Span::raw(" "),
-        Span::styled("result", Style::default().fg(if focused { C_ACCENT } else { C_ACCENT2 }).bold()),
+        Span::styled("result", Style::default().fg(if focused { c_accent() } else { c_accent2() }).bold()),
         Span::raw("  "),
         badge,
         Span::raw(" "),
@@ -725,7 +1077,7 @@ fn draw_result_pane(frame: &mut Frame, area: Rect, app: &mut App) {
 
     if is_err {
         let body: Vec<Line> = app.result_text.lines().map(|l| {
-            Line::from(Span::styled(l.to_string(), Style::default().fg(C_ERR)))
+            Line::from(Span::styled(l.to_string(), Style::default().fg(c_err())))
         }).collect();
         let para = Paragraph::new(body).block(block).wrap(Wrap { trim: false });
         frame.render_widget(para, area);
@@ -733,7 +1085,7 @@ fn draw_result_pane(frame: &mut Frame, area: Rect, app: &mut App) {
         let body = vec![
             Line::from(""),
             Line::from(Span::styled("  (type an expression below to query the JSON)",
-                Style::default().fg(C_MUTED).italic())),
+                Style::default().fg(c_muted()).italic())),
         ];
         let para = Paragraph::new(body).block(block).wrap(Wrap { trim: false });
         frame.render_widget(para, area);
@@ -746,18 +1098,18 @@ fn draw_expr_pane(frame: &mut Frame, area: Rect, app: &mut App) {
     let focused = matches!(app.focus, Focus::Expr);
     let title = Line::from(vec![
         Span::raw(" "),
-        Span::styled("❯", Style::default().fg(if focused { C_ACCENT } else { C_MUTED }).bold()),
+        Span::styled("❯", Style::default().fg(if focused { c_accent() } else { c_muted() }).bold()),
         Span::raw(" "),
-        Span::styled("expr", Style::default().fg(if focused { C_ACCENT } else { C_MUTED }).bold()),
+        Span::styled("expr", Style::default().fg(if focused { c_accent() } else { c_muted() }).bold()),
         Span::raw(" "),
     ]);
     let block = pane_block(title, focused);
     app.expr_area.set_block(block);
     // cursor style
     let cursor_style = if focused {
-        Style::default().bg(C_ACCENT).fg(Color::Black)
+        Style::default().bg(c_accent()).fg(Color::Black)
     } else {
-        Style::default().bg(C_MUTED).fg(Color::Black)
+        Style::default().bg(c_muted()).fg(Color::Black)
     };
     app.expr_area.set_cursor_style(cursor_style);
     frame.render_widget(&app.expr_area, area);
@@ -765,9 +1117,9 @@ fn draw_expr_pane(frame: &mut Frame, area: Rect, app: &mut App) {
 
 fn pane_block<'a>(title: Line<'a>, focused: bool) -> Block<'a> {
     let border_style = if focused {
-        Style::default().fg(C_ACCENT).bold()
+        Style::default().fg(c_accent()).bold()
     } else {
-        Style::default().fg(C_MUTED)
+        Style::default().fg(c_muted())
     };
     Block::default()
         .borders(Borders::ALL)
@@ -776,31 +1128,112 @@ fn pane_block<'a>(title: Line<'a>, focused: bool) -> Block<'a> {
         .title(title)
 }
 
-fn draw_status(frame: &mut Frame, area: Rect, _app: &App) {
-    let bg = Style::default().bg(Color::Rgb(0x1a, 0x1b, 0x26));
+fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
+    let bg = Style::default().bg(c_modeline_bg());
+    let txt = c_hint();
     frame.render_widget(Paragraph::new("").style(bg), area);
 
-    let key = |k: &'static str| Span::styled(
-        format!(" {} ", k),
-        Style::default().bg(C_WARN).fg(Color::Black).bold(),
-    );
-    let lbl = |s: &'static str| Span::styled(
-        format!(" {}  ", s),
-        Style::default().fg(Color::Rgb(0xa9, 0xb1, 0xd6)),
-    );
+    // pane info
+    let (pane_name, pane_color, line_ix, col_ix, total_lines, total_chars) = match app.focus {
+        Focus::Json => {
+            let total_chars: usize = app.json.lines.iter().map(|l| l.chars().count()).sum();
+            ("JSON", c_accent(),
+             app.json.row + 1, app.json.col + 1,
+             app.json.lines.len(), total_chars)
+        }
+        Focus::Expr => {
+            let lines = app.expr_area.lines();
+            let (r, c) = app.expr_area.cursor();
+            let total_chars: usize = lines.iter().map(|l| l.chars().count()).sum();
+            ("EXPR", c_accent2(), r + 1, c + 1, lines.len(), total_chars)
+        }
+        Focus::Result => {
+            let total_chars: usize = app.result.lines.iter().map(|l| l.chars().count()).sum();
+            ("RESULT", c_ok(),
+             app.result.row + 1, app.result.col + 1,
+             app.result.lines.len(), total_chars)
+        }
+    };
+    let percent = if total_lines == 0 { 0 } else {
+        ((line_ix * 100) / total_lines).min(100)
+    };
+    let pos_label = if line_ix == 1 && total_lines <= 1 { "All".to_string() }
+        else if line_ix == 1 { "Top".to_string() }
+        else if line_ix >= total_lines { "Bot".to_string() }
+        else { format!("{:>2}%", percent) };
+
+    // status indicators
+    let mut indicators = String::new();
+    if app.parse_err.is_some() { indicators.push('!'); }
+    else if app.parsed_doc.is_some() { indicators.push('*'); }
+    else { indicators.push('-'); }
+    if app.popup_open { indicators.push('C'); }
+    if !app.json.folded.is_empty() || !app.result.folded.is_empty() { indicators.push('F'); }
+    if app.chord.is_some() { indicators.push('K'); }
+
+    let eval_str = if app.last_eval_ns == 0 {
+        "—".to_string()
+    } else if app.last_eval_ns < 1_000 {
+        format!("{}ns", app.last_eval_ns)
+    } else if app.last_eval_ns < 1_000_000 {
+        format!("{:.1}µs", app.last_eval_ns as f64 / 1_000.0)
+    } else if app.last_eval_ns < 1_000_000_000 {
+        format!("{:.2}ms", app.last_eval_ns as f64 / 1_000_000.0)
+    } else {
+        format!("{:.2}s", app.last_eval_ns as f64 / 1_000_000_000.0)
+    };
+
+    let bytes_str = format_bytes(app.last_result_bytes);
+
+    let sep = || Span::styled("  ─  ", Style::default().fg(c_muted()));
+    let dim = |s: String| Span::styled(s, Style::default().fg(txt));
+    let key = |s: String| Span::styled(s, Style::default().fg(c_warn()).bold());
 
     let line = Line::from(vec![
+        // emacs-style left chrome: -U:**-
+        Span::styled(format!("─{}─ ", indicators),
+            Style::default().fg(c_muted())),
+        Span::styled(" jetrocli ",
+            Style::default().bg(c_accent2()).fg(Color::Black).bold()),
+        sep(),
+        Span::styled(format!(" {} ", pane_name),
+            Style::default().bg(pane_color).fg(Color::Black).bold()),
+        sep(),
+        // position
+        Span::styled("L", Style::default().fg(c_muted())),
+        key(format!("{}", line_ix)),
+        Span::styled(":", Style::default().fg(c_muted())),
+        key(format!("{}", col_ix)),
         Span::raw(" "),
-        key("C-o"), lbl("switch"),
-        key("C-c f"), lbl("fold"),
-        key("C-c a/u"), lbl("all/none"),
-        key("C-␣"), lbl("complete"),
-        key("C-c C-f"), lbl("fmt"),
-        key("C-x C-s"), lbl("copy"),
-        key("S-⏎"), lbl("eval"),
-        key("C-c C-c"), lbl("quit"),
+        Span::styled(format!("({}L {}c)", total_lines, total_chars),
+            Style::default().fg(c_muted()).italic()),
+        Span::raw(" "),
+        Span::styled(pos_label, Style::default().fg(c_accent()).bold()),
+        sep(),
+        // evaluation time
+        Span::styled("⏱ ", Style::default().fg(c_warn())),
+        dim(format!("eval {}", eval_str)),
+        Span::raw("  "),
+        Span::styled("Σ ", Style::default().fg(c_warn())),
+        dim(format!("{}", app.eval_count)),
+        Span::raw("  "),
+        Span::styled("◈ ", Style::default().fg(c_accent2())),
+        dim(bytes_str),
+        sep(),
+        // hints
+        Span::styled("C-c h", Style::default().fg(c_warn()).bold()),
+        Span::styled(" help",  Style::default().fg(c_muted())),
     ]).style(bg);
+
     frame.render_widget(Paragraph::new(line), area);
+}
+
+fn format_bytes(n: usize) -> String {
+    const KB: usize = 1024;
+    const MB: usize = 1024 * 1024;
+    if n < KB { format!("{}B", n) }
+    else if n < MB { format!("{:.1}K", n as f64 / KB as f64) }
+    else { format!("{:.2}M", n as f64 / MB as f64) }
 }
 
 fn draw_popup(frame: &mut Frame, expr_area: Rect, size: Rect, app: &mut App) {
@@ -828,27 +1261,27 @@ fn draw_popup(frame: &mut Frame, expr_area: Rect, size: Rect, app: &mut App) {
 
     let items: Vec<ListItem> = app.candidates.iter().map(|c| {
         let (tag, color) = match c.kind {
-            CandKind::Field   => ("fld", C_OK),
-            CandKind::Method  => ("fn ", C_ACCENT),
-            CandKind::Keyword => ("kw ", C_ACCENT2),
-            CandKind::Snippet => ("snp", C_WARN),
+            CandKind::Field   => ("fld", c_ok()),
+            CandKind::Method  => ("fn ", c_accent()),
+            CandKind::Keyword => ("kw ", c_accent2()),
+            CandKind::Snippet => ("snp", c_warn()),
         };
         ListItem::new(Line::from(vec![
             Span::raw(" "),
             Span::styled(format!(" {} ", tag),
                 Style::default().bg(color).fg(Color::Black).bold()),
             Span::raw(" "),
-            Span::styled(c.text.clone(), Style::default().fg(Color::Rgb(0xc0, 0xca, 0xf5))),
+            Span::styled(c.text.clone(), Style::default().fg(c_body())),
         ]))
     }).collect();
 
     let list_title = Line::from(vec![
         Span::raw(" "),
-        Span::styled("✨", Style::default().fg(C_WARN)),
+        Span::styled("✨", Style::default().fg(c_warn())),
         Span::raw(" "),
-        Span::styled("completions", Style::default().fg(C_ACCENT).bold()),
+        Span::styled("completions", Style::default().fg(c_accent()).bold()),
         Span::raw(" "),
-        Span::styled(format!("({})", app.candidates.len()), Style::default().fg(C_MUTED)),
+        Span::styled(format!("({})", app.candidates.len()), Style::default().fg(c_muted())),
         Span::raw(" "),
     ]);
 
@@ -856,9 +1289,9 @@ fn draw_popup(frame: &mut Frame, expr_area: Rect, size: Rect, app: &mut App) {
         .block(Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(C_ACCENT2))
+            .border_style(Style::default().fg(c_accent2()))
             .title(list_title))
-        .highlight_style(Style::default().bg(C_ACCENT).fg(Color::Black).bold())
+        .highlight_style(Style::default().bg(c_accent()).fg(Color::Black).bold())
         .highlight_symbol("▶ ");
 
     frame.render_widget(Clear, outer);
@@ -870,19 +1303,19 @@ fn draw_popup(frame: &mut Frame, expr_area: Rect, size: Rect, app: &mut App) {
         let body: Vec<Line> = match selected {
             Some(c) => render_doc(c),
             None => vec![Line::from(Span::styled("no selection",
-                Style::default().fg(C_MUTED).italic()))],
+                Style::default().fg(c_muted()).italic()))],
         };
         let doc_title = Line::from(vec![
             Span::raw(" "),
-            Span::styled("📖", Style::default().fg(C_WARN)),
+            Span::styled("📖", Style::default().fg(c_warn())),
             Span::raw(" "),
-            Span::styled("docs", Style::default().fg(C_ACCENT2).bold()),
+            Span::styled("docs", Style::default().fg(c_accent2()).bold()),
             Span::raw(" "),
         ]);
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(C_MUTED))
+            .border_style(Style::default().fg(c_muted()))
             .title(doc_title);
         let para = Paragraph::new(body).block(block).wrap(Wrap { trim: false });
         frame.render_widget(para, doc_area);
@@ -896,7 +1329,7 @@ fn render_doc(c: &Candidate) -> Vec<Line<'static>> {
     if let Some(first) = iter.next() {
         lines.push(Line::from(Span::styled(
             first.to_string(),
-            Style::default().fg(C_ACCENT).bold(),
+            Style::default().fg(c_accent()).bold(),
         )));
     }
     let mut in_example = false;
@@ -907,7 +1340,7 @@ fn render_doc(c: &Candidate) -> Vec<Line<'static>> {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "Example".to_string(),
-                Style::default().fg(C_WARN).bold(),
+                Style::default().fg(c_warn()).bold(),
             )));
             continue;
         }
@@ -925,14 +1358,14 @@ fn render_doc(c: &Candidate) -> Vec<Line<'static>> {
         } else {
             lines.push(Line::from(Span::styled(
                 l,
-                Style::default().fg(Color::Rgb(0xa9, 0xb1, 0xd6)),
+                Style::default().fg(c_hint()),
             )));
         }
     }
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(
             "(no docs)".to_string(),
-            Style::default().fg(C_MUTED).italic(),
+            Style::default().fg(c_muted()).italic(),
         )));
     }
     lines
@@ -953,9 +1386,9 @@ fn highlight_expr_spans(line: &str) -> Vec<Span<'static>> {
             }
             if i < chars.len() { i += 1; }
             let s: String = chars[start..i].iter().collect();
-            spans.push(Span::styled(s, Style::default().fg(C_STR)));
+            spans.push(Span::styled(s, Style::default().fg(c_str())));
         } else if c == '$' || c == '@' {
-            spans.push(Span::styled(c.to_string(), Style::default().fg(C_ACCENT2).bold()));
+            spans.push(Span::styled(c.to_string(), Style::default().fg(c_accent2()).bold()));
             i += 1;
         } else if c.is_alphabetic() || c == '_' {
             let start = i;
@@ -964,23 +1397,23 @@ fn highlight_expr_spans(line: &str) -> Vec<Span<'static>> {
             let is_method = i < chars.len() && chars[i] == '(';
             let kws = ["lambda","let","not","and","or","kind","when","for","in","if"];
             let style = if kws.contains(&s.as_str()) {
-                Style::default().fg(C_BOOL).bold()
+                Style::default().fg(c_bool()).bold()
             } else if is_method {
-                Style::default().fg(C_ACCENT).bold()
+                Style::default().fg(c_accent()).bold()
             } else {
-                Style::default().fg(C_KEY)
+                Style::default().fg(c_key())
             };
             spans.push(Span::styled(s, style));
         } else if c.is_ascii_digit() {
             let start = i;
             while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') { i += 1; }
             let s: String = chars[start..i].iter().collect();
-            spans.push(Span::styled(s, Style::default().fg(C_NUM)));
+            spans.push(Span::styled(s, Style::default().fg(c_num())));
         } else if "()[]{}".contains(c) {
-            spans.push(Span::styled(c.to_string(), Style::default().fg(C_BRACE).bold()));
+            spans.push(Span::styled(c.to_string(), Style::default().fg(c_brace()).bold()));
             i += 1;
         } else if c == '.' || c == ',' || c == ':' || c == ';' {
-            spans.push(Span::styled(c.to_string(), Style::default().fg(C_PUNCT)));
+            spans.push(Span::styled(c.to_string(), Style::default().fg(c_punct())));
             i += 1;
         } else {
             spans.push(Span::raw(c.to_string()));
@@ -1015,9 +1448,9 @@ fn highlight_json_spans(line: &str) -> Vec<Span<'static>> {
             let is_key = j < bytes.len() && bytes[j] == b':';
             let text = line[start..i].to_string();
             let style = if is_key {
-                Style::default().fg(C_KEY).bold()
+                Style::default().fg(c_key()).bold()
             } else {
-                Style::default().fg(C_STR)
+                Style::default().fg(c_str())
             };
             spans.push(Span::styled(text, style));
         } else if c.is_ascii_digit()
@@ -1032,22 +1465,22 @@ fn highlight_json_spans(line: &str) -> Vec<Span<'static>> {
                 } else { break; }
             }
             spans.push(Span::styled(line[start..i].to_string(),
-                Style::default().fg(C_NUM)));
+                Style::default().fg(c_num())));
         } else if line[i..].starts_with("true") {
-            spans.push(Span::styled("true".to_string(), Style::default().fg(C_BOOL).bold()));
+            spans.push(Span::styled("true".to_string(), Style::default().fg(c_bool()).bold()));
             i += 4;
         } else if line[i..].starts_with("false") {
-            spans.push(Span::styled("false".to_string(), Style::default().fg(C_BOOL).bold()));
+            spans.push(Span::styled("false".to_string(), Style::default().fg(c_bool()).bold()));
             i += 5;
         } else if line[i..].starts_with("null") {
-            spans.push(Span::styled("null".to_string(), Style::default().fg(C_MUTED).italic()));
+            spans.push(Span::styled("null".to_string(), Style::default().fg(c_muted()).italic()));
             i += 4;
         } else if "{}[]".contains(c) {
             spans.push(Span::styled(c.to_string(),
-                Style::default().fg(C_BRACE).bold()));
+                Style::default().fg(c_brace()).bold()));
             i += 1;
         } else if c == ':' || c == ',' {
-            spans.push(Span::styled(c.to_string(), Style::default().fg(C_PUNCT)));
+            spans.push(Span::styled(c.to_string(), Style::default().fg(c_punct())));
             i += 1;
         } else {
             spans.push(Span::raw(c.to_string()));
@@ -1106,6 +1539,39 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(
         if key.kind != event::KeyEventKind::Press { continue; }
 
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt  = key.modifiers.contains(KeyModifiers::ALT);
+
+        // help popup: any key closes
+        if app.help_open {
+            app.help_open = false;
+            continue;
+        }
+        // search overlay consumes all keys
+        if app.search.is_some() {
+            handle_search_key(app, key);
+            continue;
+        }
+        // command palette overlay
+        if app.palette.is_some() {
+            if handle_palette_key(app, key) { return Ok(()); }
+            continue;
+        }
+
+        // C-s / C-r start isearch; M-x opens palette (only if popup not open)
+        if !app.popup_open {
+            if ctrl && matches!(key.code, KeyCode::Char('s')) {
+                start_search(app, SearchDir::Forward);
+                continue;
+            }
+            if ctrl && matches!(key.code, KeyCode::Char('r')) {
+                start_search(app, SearchDir::Backward);
+                continue;
+            }
+            if alt && matches!(key.code, KeyCode::Char('x')) {
+                app.palette = Some(PaletteState { query: String::new(), selected: 0 });
+                continue;
+            }
+        }
 
         // chord resolution: last key was C-c, this key is the action
         if app.chord == Some('c') {
@@ -1121,6 +1587,16 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(
                     Focus::Expr   => reformat_expr(app),
                     Focus::Result => { /* already pretty */ }
                 }
+                continue;
+            }
+            // C-c h → show help popup
+            if matches!(key.code, KeyCode::Char('h')) {
+                app.help_open = true;
+                continue;
+            }
+            // C-c l → toggle theme (light/dark)
+            if matches!(key.code, KeyCode::Char('l')) {
+                toggle_theme();
                 continue;
             }
             // C-c C-k → clear current buffer
@@ -1279,6 +1755,376 @@ fn handle_json(app: &mut App, key: KeyEvent) -> Result<()> {
         app.evaluate();
     }
     Ok(())
+}
+
+// ── Incremental search ──────────────────────────────────────────────────────
+
+fn start_search(app: &mut App, dir: SearchDir) {
+    let target = match app.focus {
+        Focus::Json   => SearchTarget::Json,
+        Focus::Result => SearchTarget::Result,
+        Focus::Expr   => SearchTarget::Expr,
+    };
+    let prev_mode = app.search.as_ref().map(|s| s.mode).unwrap_or(SearchMode::Word);
+    let prev_query = app.search.as_ref().map(|s| s.query.clone()).unwrap_or_default();
+    let (cr, cc) = app.expr_area.cursor();
+    app.search = Some(SearchState {
+        query:        prev_query,
+        direction:    dir,
+        mode:         prev_mode,
+        target,
+        failed:       false,
+        invalid_re:   false,
+        origin_json:   (app.json.row, app.json.col, app.json.scroll_row),
+        origin_result: (app.result.row, app.result.col, app.result.scroll_row),
+        origin_expr:   (cr as u16, cc as u16),
+    });
+    run_search(app, false);
+}
+
+fn build_pattern(query: &str, mode: SearchMode) -> Option<Regex> {
+    if query.is_empty() { return None; }
+    let pat = match mode {
+        SearchMode::Regex => query.to_string(),
+        SearchMode::Word  => regex::escape(query),
+    };
+    Regex::new(&pat).ok()
+}
+
+fn col_to_byte(s: &str, col: usize) -> usize {
+    s.char_indices().nth(col).map(|(b,_)| b).unwrap_or(s.len())
+}
+fn byte_to_col(s: &str, byte: usize) -> usize {
+    s[..byte.min(s.len())].chars().count()
+}
+
+fn search_lines(
+    lines: &[String],
+    pat: &Regex,
+    dir: SearchDir,
+    from_row: usize,
+    from_col: usize,
+    advance: bool,
+) -> Option<(usize, usize)> {
+    if lines.is_empty() { return None; }
+    match dir {
+        SearchDir::Forward => {
+            for r in from_row..lines.len() {
+                let line = &lines[r];
+                let start_byte = if r == from_row {
+                    let cb = col_to_byte(line, from_col);
+                    if advance { (cb + 1).min(line.len()) } else { cb }
+                } else { 0 };
+                if start_byte > line.len() { continue; }
+                if let Some(m) = pat.find_at(line, start_byte) {
+                    return Some((r, byte_to_col(line, m.start())));
+                }
+            }
+            // wrap
+            for r in 0..from_row.min(lines.len()) {
+                let line = &lines[r];
+                if let Some(m) = pat.find(line) {
+                    return Some((r, byte_to_col(line, m.start())));
+                }
+            }
+        }
+        SearchDir::Backward => {
+            for r in (0..=from_row.min(lines.len().saturating_sub(1))).rev() {
+                let line = &lines[r];
+                let upper = if r == from_row {
+                    let cb = col_to_byte(line, from_col);
+                    if advance { cb } else { (cb + 1).min(line.len()) }
+                } else { line.len() };
+                let slice = &line[..upper.min(line.len())];
+                if let Some(m) = pat.find_iter(slice).last() {
+                    return Some((r, byte_to_col(line, m.start())));
+                }
+            }
+            // wrap
+            for r in (from_row + 1..lines.len()).rev() {
+                let line = &lines[r];
+                if let Some(m) = pat.find_iter(line).last() {
+                    return Some((r, byte_to_col(line, m.start())));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn run_search(app: &mut App, advance: bool) {
+    let Some(s) = app.search.as_mut() else { return; };
+    if s.query.is_empty() {
+        s.failed = false;
+        s.invalid_re = false;
+        return;
+    }
+    let pat = match build_pattern(&s.query, s.mode) {
+        Some(p) => p,
+        None => { s.invalid_re = true; s.failed = true; return; }
+    };
+    s.invalid_re = false;
+    let dir = s.direction;
+    match s.target {
+        SearchTarget::Json => {
+            let from = (app.json.row, app.json.col);
+            if let Some((r, c)) = search_lines(&app.json.lines, &pat, dir, from.0, from.1, advance) {
+                let folds = detect_folds(&app.json.lines);
+                unfold_around(&mut app.json, r, &folds);
+                app.json.row = r;
+                app.json.col = c;
+                app.json.clamp_all();
+                s.failed = false;
+            } else { s.failed = true; }
+        }
+        SearchTarget::Result => {
+            let from = (app.result.row, app.result.col);
+            if let Some((r, c)) = search_lines(&app.result.lines, &pat, dir, from.0, from.1, advance) {
+                let folds = detect_folds(&app.result.lines);
+                unfold_around(&mut app.result, r, &folds);
+                app.result.row = r;
+                app.result.col = c;
+                app.result.clamp_all();
+                s.failed = false;
+            } else { s.failed = true; }
+        }
+        SearchTarget::Expr => {
+            let lines: Vec<String> = app.expr_area.lines().iter().map(|l| l.to_string()).collect();
+            let (from_row, from_col) = app.expr_area.cursor();
+            if let Some((r, c)) = search_lines(&lines, &pat, dir, from_row, from_col, advance) {
+                app.expr_area.move_cursor(tui_textarea::CursorMove::Jump(r as u16, c as u16));
+                s.failed = false;
+            } else { s.failed = true; }
+        }
+    }
+}
+
+fn unfold_around(ed: &mut JsonEditor, row: usize, folds: &HashMap<usize, usize>) {
+    let folded: Vec<usize> = ed.folded.iter().copied().collect();
+    for h in folded {
+        if let Some(&e) = folds.get(&h) {
+            if row > h && row <= e { ed.folded.remove(&h); }
+        }
+    }
+}
+
+fn cancel_search(app: &mut App) {
+    let Some(s) = app.search.take() else { return; };
+    // restore origin
+    app.json.row = s.origin_json.0;
+    app.json.col = s.origin_json.1;
+    app.json.scroll_row = s.origin_json.2;
+    app.json.clamp_all();
+    app.result.row = s.origin_result.0;
+    app.result.col = s.origin_result.1;
+    app.result.scroll_row = s.origin_result.2;
+    app.result.clamp_all();
+    app.expr_area.move_cursor(tui_textarea::CursorMove::Jump(
+        s.origin_expr.0,
+        s.origin_expr.1,
+    ));
+}
+
+fn handle_search_key(app: &mut App, key: KeyEvent) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt  = key.modifiers.contains(KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Esc => { cancel_search(app); return; }
+        KeyCode::Char('g') if ctrl => { cancel_search(app); return; }
+        KeyCode::Enter => { app.search = None; return; }
+        KeyCode::Char('s') if ctrl => {
+            if let Some(s) = app.search.as_mut() { s.direction = SearchDir::Forward; }
+            run_search(app, true);
+            return;
+        }
+        KeyCode::Char('r') if ctrl => {
+            if let Some(s) = app.search.as_mut() { s.direction = SearchDir::Backward; }
+            run_search(app, true);
+            return;
+        }
+        KeyCode::Char('w') if ctrl => {
+            if let Some(s) = app.search.as_mut() { s.mode = SearchMode::Word; }
+            run_search(app, false);
+            return;
+        }
+        KeyCode::Char('r') if alt => {
+            if let Some(s) = app.search.as_mut() {
+                s.mode = if s.mode == SearchMode::Regex { SearchMode::Word } else { SearchMode::Regex };
+            }
+            run_search(app, false);
+            return;
+        }
+        KeyCode::Backspace => {
+            if let Some(s) = app.search.as_mut() { s.query.pop(); }
+            run_search(app, false);
+            return;
+        }
+        KeyCode::Char(c) if !ctrl && !alt => {
+            if let Some(s) = app.search.as_mut() { s.query.push(c); }
+            run_search(app, false);
+            return;
+        }
+        _ => {}
+    }
+}
+
+// ── Command palette (M-x) ───────────────────────────────────────────────────
+
+const COMMANDS: &[(&str, &str)] = &[
+    ("format-buffer",     "Pretty-format focused buffer (JSON or expr)"),
+    ("fold-all",          "Collapse every block in current editor"),
+    ("unfold-all",        "Expand every block in current editor"),
+    ("clear-buffer",      "Clear focused buffer"),
+    ("copy-buffer",       "Copy focused buffer to clipboard"),
+    ("evaluate",          "Re-evaluate expression"),
+    ("search-forward",    "Incremental search forward"),
+    ("search-backward",   "Incremental search backward"),
+    ("toggle-regex",      "Toggle regex mode in next search"),
+    ("toggle-word",       "Toggle word (literal) mode in next search"),
+    ("focus-next",        "Cycle pane focus"),
+    ("quit",              "Exit jetrocli"),
+];
+
+fn palette_filtered(query: &str) -> Vec<(usize, &'static str, &'static str)> {
+    let q = query.to_lowercase();
+    COMMANDS.iter().enumerate()
+        .filter(|(_, (n, _))| q.is_empty() || n.contains(&q))
+        .map(|(i, (n, d))| (i, *n, *d))
+        .collect()
+}
+
+/// Returns true if event loop should `return Ok(())` (quit).
+fn handle_palette_key(app: &mut App, key: KeyEvent) -> bool {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc => { app.palette = None; }
+        KeyCode::Char('g') if ctrl => { app.palette = None; }
+        KeyCode::Up   => { if let Some(p) = app.palette.as_mut() { p.selected = p.selected.saturating_sub(1); } }
+        KeyCode::Down => {
+            if let Some(p) = app.palette.as_mut() {
+                let n = palette_filtered(&p.query).len();
+                if n > 0 && p.selected + 1 < n { p.selected += 1; }
+            }
+        }
+        KeyCode::Char('p') if ctrl => { if let Some(p) = app.palette.as_mut() { p.selected = p.selected.saturating_sub(1); } }
+        KeyCode::Char('n') if ctrl => {
+            if let Some(p) = app.palette.as_mut() {
+                let n = palette_filtered(&p.query).len();
+                if n > 0 && p.selected + 1 < n { p.selected += 1; }
+            }
+        }
+        KeyCode::Backspace => { if let Some(p) = app.palette.as_mut() { p.query.pop(); p.selected = 0; } }
+        KeyCode::Enter => {
+            let cmd = app.palette.as_ref().and_then(|p| {
+                palette_filtered(&p.query).get(p.selected).map(|(_, n, _)| *n)
+            });
+            app.palette = None;
+            if let Some(name) = cmd { return run_command(app, name); }
+        }
+        KeyCode::Char(c) if !ctrl => {
+            if let Some(p) = app.palette.as_mut() { p.query.push(c); p.selected = 0; }
+        }
+        _ => {}
+    }
+    false
+}
+
+fn run_command(app: &mut App, name: &str) -> bool {
+    match name {
+        "format-buffer" => match app.focus {
+            Focus::Json   => reformat_json(app),
+            Focus::Expr   => reformat_expr(app),
+            Focus::Result => {}
+        },
+        "fold-all" => {
+            let target: Option<&mut JsonEditor> = match app.focus {
+                Focus::Json   => Some(&mut app.json),
+                Focus::Result => Some(&mut app.result),
+                Focus::Expr   => None,
+            };
+            if let Some(e) = target {
+                let folds = detect_folds(&e.lines);
+                e.fold_all(&folds);
+            }
+        }
+        "unfold-all" => {
+            let target: Option<&mut JsonEditor> = match app.focus {
+                Focus::Json   => Some(&mut app.json),
+                Focus::Result => Some(&mut app.result),
+                Focus::Expr   => None,
+            };
+            if let Some(e) = target { e.unfold_all(); }
+        }
+        "clear-buffer" => match app.focus {
+            Focus::Json => {
+                app.json = JsonEditor::from_text("");
+                app.reparse_json();
+                app.evaluate();
+            }
+            Focus::Expr => {
+                app.expr_area.select_all();
+                app.expr_area.cut();
+                app.popup_open = false;
+                app.candidates.clear();
+                app.evaluate();
+            }
+            Focus::Result => {
+                app.result_text.clear();
+                app.result = JsonEditor::from_text("");
+            }
+        },
+        "copy-buffer" => {
+            let text = match app.focus {
+                Focus::Json   => app.json.text(),
+                Focus::Expr   => app.expr_area.lines().join("\n"),
+                Focus::Result => app.result_text.clone(),
+            };
+            copy_to_clipboard(&text);
+        }
+        "evaluate"        => app.evaluate(),
+        "search-forward"  => start_search(app, SearchDir::Forward),
+        "search-backward" => start_search(app, SearchDir::Backward),
+        "toggle-regex" => {
+            // remember mode for next isearch
+            let mode = match app.search.as_ref().map(|s| s.mode) {
+                Some(SearchMode::Regex) => SearchMode::Word,
+                _ => SearchMode::Regex,
+            };
+            app.search = Some(SearchState {
+                query:      String::new(),
+                direction:  SearchDir::Forward,
+                mode,
+                target:     SearchTarget::Json,
+                failed:     false, invalid_re: false,
+                origin_json:   (app.json.row, app.json.col, app.json.scroll_row),
+                origin_result: (app.result.row, app.result.col, app.result.scroll_row),
+                origin_expr:   (0, 0),
+            });
+            // start a session immediately so user sees mode applied
+        }
+        "toggle-word" => {
+            app.search = Some(SearchState {
+                query:      String::new(),
+                direction:  SearchDir::Forward,
+                mode:       SearchMode::Word,
+                target:     SearchTarget::Json,
+                failed:     false, invalid_re: false,
+                origin_json:   (app.json.row, app.json.col, app.json.scroll_row),
+                origin_result: (app.result.row, app.result.col, app.result.scroll_row),
+                origin_expr:   (0, 0),
+            });
+        }
+        "focus-next" => {
+            app.focus = match app.focus {
+                Focus::Json   => Focus::Expr,
+                Focus::Expr   => Focus::Result,
+                Focus::Result => Focus::Json,
+            };
+        }
+        "quit" => return true,
+        _ => {}
+    }
+    false
 }
 
 fn copy_to_clipboard(text: &str) {
@@ -1524,6 +2370,7 @@ fn popup_move(app: &mut App, delta: i32) {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    init_palette(cli.theme);
 
     let json_seed = match cli.input {
         Some(p) => fs::read_to_string(&p)

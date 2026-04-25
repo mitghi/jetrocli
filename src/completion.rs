@@ -286,13 +286,43 @@ fn apply_method_shape(s: &Shape, name: &str) -> Option<Shape> {
     let empty_obj = || Shape::Object(Default::default());
     match name {
         // element extraction
-        "first" | "last" | "nth" | "find" => s.element().cloned(),
+        "first" | "last" | "nth" | "find" | "index"
+        | "min_by" | "max_by" => s.element().cloned(),
         // array → array (same element type)
         "filter" | "sort" | "reverse" | "unique" | "unique_by" | "distinct"
         | "compact" | "take_while" | "takewhile" | "drop_while" | "dropwhile"
         | "enumerate" | "accumulate" | "append" | "prepend" | "remove"
         | "diff" | "intersect" | "union" | "slice" | "find_all"
-        | "collect" | "flatten" | "explode" => Some(s.clone()),
+        | "collect" | "flatten" | "explode"
+        | "lag" | "lead" => Some(s.clone()),
+        // numeric series
+        "rolling_sum" | "rolling_avg" | "rolling_min" | "rolling_max"
+        | "cummin" | "cummax" | "diff_window" | "pct_change" | "zscore"
+            => Some(arr_of(Shape::Float)),
+        // index lookups
+        "find_index" | "byte_len" | "chars_of"
+            => Some(Shape::Int),
+        "indices_of" | "indices_where"
+            => Some(arr_of(Shape::Int)),
+        // string predicates
+        "is_alpha" | "is_ascii" | "is_blank" | "is_numeric"
+        | "contains_all" | "contains_any" | "re_match"
+            => Some(Shape::Bool),
+        // string regex captures
+        "captures" | "match_all"      => Some(arr_of(Shape::Str)),
+        "captures_all"                => Some(arr_of(arr_of(Shape::Str))),
+        "match_first"                 => Some(Shape::Str),
+        "replace_re" | "replace_all_re" | "repeat_str" | "reverse_str"
+        | "center"                    => Some(Shape::Str),
+        "split_re"                    => Some(arr_of(Shape::Str)),
+        // case conversions
+        "camel_case" | "snake_case" | "kebab_case" | "pascal_case"
+            => Some(Shape::Str),
+        // bytes
+        "bytes" => Some(arr_of(Shape::Int)),
+        // parsing
+        "parse_int" | "parse_float" => Some(Shape::Float),
+        "parse_bool" => Some(Shape::Bool),
         // array-of-array
         "window" | "chunk" | "batch" | "pairwise" | "partition" | "zip" | "zip_longest" =>
             Some(arr_of(s.clone())),
@@ -385,18 +415,26 @@ fn method_applies(name: &str, recv: &Option<&Shape>) -> bool {
     let is_str = matches!(s, Shape::Str);
     let arr_only  = ["filter","map","flat_map","sort","flatten","first","last","nth",
                      "append","prepend","remove","diff","intersect","union","enumerate",
-                     "window","chunk","batch","take_while","drop_while","accumulate",
-                     "partition","zip","zip_longest","pairwise","reverse","unique","distinct",
-                     "compact","sum","avg","count","group_by","count_by","index_by",
-                     "min","max","any","all","equi_join"];
-    let str_only  = ["upper","lower","capitalize","title_case","trim","trim_left","trim_right",
-                     "lines","words","chars","to_number","to_bool","url_encode","url_decode",
-                     "html_escape","html_unescape","repeat","pad_left","pad_right",
-                     "starts_with","ends_with","replace","replace_all","strip_prefix","strip_suffix",
-                     "slice","indent","dedent","matches","scan","to_base64","from_base64"];
+                     "window","chunk","batch","take_while","takewhile","drop_while","dropwhile",
+                     "accumulate","partition","zip","zip_longest","pairwise","reverse","unique",
+                     "unique_by","distinct","compact","sum","avg","count","count_by","group_by",
+                     "index_by","min","max","min_by","max_by","any","all","equi_join","explode",
+                     "fanout","find","find_all","find_index","indices_of","indices_where",
+                     "contains_all","contains_any","rolling_sum","rolling_avg","rolling_min",
+                     "rolling_max","cummin","cummax","diff_window","pct_change","lag","lead",
+                     "zscore","collect","index"];
+    let str_only  = ["upper","lower","capitalize","title_case","camel_case","snake_case",
+                     "kebab_case","pascal_case","trim","trim_left","trim_right","lines","words",
+                     "chars","to_number","to_bool","url_encode","url_decode","html_escape",
+                     "html_unescape","repeat","repeat_str","reverse_str","pad_left","pad_right",
+                     "center","starts_with","ends_with","replace","replace_all","replace_re",
+                     "replace_all_re","split","split_re","strip_prefix","strip_suffix","slice",
+                     "indent","dedent","matches","scan","captures","captures_all","match_first",
+                     "match_all","re_match","is_alpha","is_ascii","is_blank","is_numeric",
+                     "byte_len","bytes","chars_of","parse_int","parse_float","parse_bool"];
     let obj_only  = ["keys","values","entries","to_pairs","from_pairs","invert","pick","omit",
                      "merge","deep_merge","defaults","rename","transform_keys","transform_values",
-                     "filter_keys","filter_values","pivot"];
+                     "filter_keys","filter_values","pivot","flatten_keys","unflatten_keys"];
     if arr_only.contains(&name) && !is_arr { return false; }
     if str_only.contains(&name) && !is_str { return false; }
     if obj_only.contains(&name) && !is_obj { return false; }
@@ -842,6 +880,67 @@ fn method_doc(name: &str) -> String {
         "to_csv"    => Some(("to_csv() → string", "Encode array of records as CSV.", "$.rows.to_csv()")),
         "to_tsv"    => Some(("to_tsv() → string", "Encode array of records as TSV.", "$.rows.to_tsv()")),
         "implode" => Some(("implode(sep) → string", "Join array of strings (alias of join).", "$.words.implode(\" \")")),
+
+        // ── case conversion ─────────────────────────────────────────────────
+        "camel_case"  => Some(("camel_case() → string",  "Convert to camelCase.",  "$.field.camel_case()  // \"user_id\" -> \"userId\"")),
+        "snake_case"  => Some(("snake_case() → string",  "Convert to snake_case.", "$.field.snake_case()  // \"userId\" -> \"user_id\"")),
+        "kebab_case"  => Some(("kebab_case() → string",  "Convert to kebab-case.", "$.field.kebab_case()  // \"userId\" -> \"user-id\"")),
+        "pascal_case" => Some(("pascal_case() → string", "Convert to PascalCase.", "$.field.pascal_case() // \"user_id\" -> \"UserId\"")),
+
+        // ── string predicates ──────────────────────────────────────────────
+        "is_alpha"   => Some(("is_alpha() → bool",   "True if every char is alphabetic.",            "$.s.is_alpha()")),
+        "is_ascii"   => Some(("is_ascii() → bool",   "True if every char is ASCII.",                 "$.s.is_ascii()")),
+        "is_blank"   => Some(("is_blank() → bool",   "True if string is empty or whitespace only.",  "$.s.is_blank()")),
+        "is_numeric" => Some(("is_numeric() → bool", "True if every char is a digit.",               "$.code.is_numeric()")),
+
+        // ── byte / char level ──────────────────────────────────────────────
+        "byte_len"  => Some(("byte_len() → int",     "Length in bytes (UTF-8).",     "$.s.byte_len()")),
+        "bytes"     => Some(("bytes() → [int]",      "Array of byte values.",        "$.s.bytes()")),
+        "chars_of"  => Some(("chars_of(set) → int",  "Count chars from given set.",  "$.s.chars_of(\"aeiou\")")),
+        "center"    => Some(("center(n, [ch]) → string", "Center-pad to width n.",   "$.s.center(20)")),
+        "repeat_str" => Some(("repeat_str(n) → string", "Repeat string n times (alias of repeat).", "$.s.repeat_str(3)")),
+        "reverse_str" => Some(("reverse_str() → string", "Reverse character order.", "$.s.reverse_str()")),
+
+        // ── regex variants ─────────────────────────────────────────────────
+        "re_match"        => Some(("re_match(re) → bool",                  "Regex match (anchored or not — see jetro docs).", "$.email.re_match(\"^[a-z]+@\")")),
+        "match_first"     => Some(("match_first(re) → string|null",        "First regex match.",                              "$.text.match_first(\"\\\\d+\")")),
+        "match_all"       => Some(("match_all(re) → [string]",             "All regex matches.",                              "$.text.match_all(\"\\\\d+\")")),
+        "captures"        => Some(("captures(re) → [string]",              "First match's capture groups.",                   "$.text.captures(\"(\\\\d+)-(\\\\w+)\")")),
+        "captures_all"    => Some(("captures_all(re) → [[string]]",        "All matches' capture groups.",                    "$.text.captures_all(\"(\\\\d+)-(\\\\w+)\")")),
+        "replace_re"      => Some(("replace_re(re, to) → string",          "Regex replace first match.",                      "$.s.replace_re(\"\\\\d+\", \"#\")")),
+        "replace_all_re"  => Some(("replace_all_re(re, to) → string",      "Regex replace all matches.",                      "$.s.replace_all_re(\"\\\\s+\", \" \")")),
+        "split_re"        => Some(("split_re(re) → [string]",              "Split string by regex.",                          "$.csv.split_re(\",\\\\s*\")")),
+
+        // ── parsing ────────────────────────────────────────────────────────
+        "parse_int"   => Some(("parse_int([base]) → int",       "Parse integer (default base 10).",  "$.s.parse_int(16)")),
+        "parse_float" => Some(("parse_float() → float",         "Parse floating-point number.",      "$.s.parse_float()")),
+        "parse_bool"  => Some(("parse_bool() → bool",           "Parse \"true\"/\"false\" / yes/no.","$.flag.parse_bool()")),
+
+        // ── indices / search on arrays ─────────────────────────────────────
+        "index"        => Some(("index(i) → any",            "Element at index (negative wraps from end; alias of nth).", "$.items.index(-1)")),
+        "find_index"   => Some(("find_index(pred) → int",    "Index of first match, or -1.",                              "$.users.find_index(.id == 42)")),
+        "indices_of"   => Some(("indices_of(x) → [int]",     "All indices where element equals x.",                       "$.tags.indices_of(\"draft\")")),
+        "indices_where"=> Some(("indices_where(pred) → [int]","All indices satisfying pred.",                              "$.nums.indices_where(@ < 0)")),
+        "contains_all" => Some(("contains_all(xs) → bool",   "True if every x in xs is present.",                         "$.tags.contains_all([\"a\",\"b\"])")),
+        "contains_any" => Some(("contains_any(xs) → bool",   "True if any x in xs is present.",                           "$.tags.contains_any([\"draft\",\"todo\"])")),
+
+        // ── aggregates / by-key ────────────────────────────────────────────
+        "min_by" => Some(("min_by(key|lambda) → any", "Element with minimum projected key.", "$.books.min_by(.price)")),
+        "max_by" => Some(("max_by(key|lambda) → any", "Element with maximum projected key.", "$.books.max_by(.price)")),
+
+        // ── windowed / running stats ───────────────────────────────────────
+        "rolling_sum" => Some(("rolling_sum(n) → [number]", "Rolling window sum of size n.", "$.prices.rolling_sum(7)")),
+        "rolling_avg" => Some(("rolling_avg(n) → [number]", "Rolling window average of size n.","$.prices.rolling_avg(7)")),
+        "rolling_min" => Some(("rolling_min(n) → [number]", "Rolling window minimum of size n.","$.prices.rolling_min(7)")),
+        "rolling_max" => Some(("rolling_max(n) → [number]", "Rolling window maximum of size n.","$.prices.rolling_max(7)")),
+        "cummin"      => Some(("cummin() → [number]",       "Cumulative minimum.",              "$.prices.cummin()")),
+        "cummax"      => Some(("cummax() → [number]",       "Cumulative maximum.",              "$.prices.cummax()")),
+        "diff_window" => Some(("diff_window(n) → [number]", "x[i] − x[i−n] differences.",       "$.prices.diff_window(1)")),
+        "pct_change"  => Some(("pct_change([n]) → [number]","Percentage change vs n steps back (default 1).", "$.prices.pct_change()")),
+        "lag"         => Some(("lag(n) → [any]",            "Shift series forward by n (pad with null).",     "$.prices.lag(1)")),
+        "lead"        => Some(("lead(n) → [any]",           "Shift series backward by n (pad with null).",    "$.prices.lead(1)")),
+        "zscore"      => Some(("zscore() → [float]",        "Standard score (x − mean) / stdev.",             "$.prices.zscore()")),
+
         _ => None,
     };
     match entry {
