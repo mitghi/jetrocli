@@ -1,5 +1,9 @@
 # jetrocli
 
+<p align="center">
+  <img src="media/jetrocli.png" alt="jetrocli">
+</p>
+
 Interactive split-pane TUI for [jetro](https://github.com/mitghi/jetro) — paste JSON, write expressions, see results live. Built on `ratatui` + `crossterm`.
 
 ## Features
