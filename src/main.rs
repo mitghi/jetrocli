@@ -1,10 +1,13 @@
 //! jetrocli — split-pane TUI for jetro.
 
 mod completion;
+mod editor;
+mod eval;
+mod shape;
+mod theme;
 
 use anyhow::{anyhow, Result};
-use clap::{Parser, ValueEnum};
-use std::sync::{Mutex, OnceLock};
+use clap::Parser;
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
@@ -21,10 +24,16 @@ use ratatui::{
 };
 use regex::Regex;
 use serde_json::Value;
-use std::{collections::{HashMap, HashSet}, fs, io, path::PathBuf, time::Instant};
+use std::{collections::HashMap, fs, io, path::PathBuf, time::Duration};
 use tui_textarea::TextArea;
 
 use completion::{Candidate, CandKind};
+use editor::{detect_folds, JsonEditor};
+use eval::{DocState, EvalState, EvalWorker};
+use theme::{
+    c_accent, c_accent2, c_body, c_bool, c_brace, c_cursor_line, c_err, c_hint, c_key, c_modeline_bg,
+    c_muted, c_num, c_ok, c_pane_bg, c_punct, c_str, c_warn, init_palette, toggle_theme, ThemeArg,
+};
 
 /// jetro interactive TUI.
 #[derive(Parser, Debug)]
@@ -43,9 +52,6 @@ struct Cli {
     theme: ThemeArg,
 }
 
-#[derive(Copy, Clone, Debug, ValueEnum)]
-enum ThemeArg { Dark, Light }
-
 enum Focus { Json, Expr, Result }
 
 struct App<'a> {
@@ -54,20 +60,22 @@ struct App<'a> {
     result:      JsonEditor,
     focus:       Focus,
 
+    /// Parsed JSON; held on UI thread for completion shape inference.
     parsed_doc:  Option<Value>,
-    parse_err:   Option<String>,
 
-    result_text: String,
+    /// Unified result/error state. Drives the result pane and status chips.
+    eval_state:  EvalState,
+
+    /// Background eval worker — owns the cached `Jetro` and `JetroEngine`.
+    eval:        EvalWorker,
 
     popup_open:  bool,
     candidates:  Vec<Candidate>,
     popup_state: ListState,
 
-    chord:       Option<char>, // pending prefix key (e.g. Some('c') after C-c)
+    chord:       Option<char>,
 
-    last_eval_ns:  u128,
-    last_result_bytes: usize,
-    eval_count:    u64,
+    eval_count:  u64,
 
     search:      Option<SearchState>,
     palette:     Option<PaletteState>,
@@ -119,8 +127,8 @@ impl<'a> App<'a> {
             result: JsonEditor::from_text(""),
             focus: Focus::Expr,
             parsed_doc: None,
-            parse_err: None,
-            result_text: String::new(),
+            eval_state: EvalState::Empty,
+            eval: EvalWorker::spawn(),
             popup_open: false,
             candidates: vec![],
             popup_state: ListState::default(),
@@ -128,8 +136,6 @@ impl<'a> App<'a> {
             search: None,
             palette: None,
             help_open: false,
-            last_eval_ns: 0,
-            last_result_bytes: 0,
             eval_count: 0,
         };
         app.reparse_json();
@@ -141,45 +147,37 @@ impl<'a> App<'a> {
         let src = self.json.text();
         if src.trim().is_empty() {
             self.parsed_doc = None;
-            self.parse_err = None;
+            self.eval.set_doc(DocState::None);
+            self.eval_state = EvalState::Empty;
+            self.sync_result_view();
             return;
         }
         match serde_json::from_str::<Value>(&src) {
-            Ok(v)  => { self.parsed_doc = Some(v); self.parse_err = None; }
-            Err(e) => { self.parsed_doc = None;    self.parse_err = Some(e.to_string()); }
+            Ok(v) => {
+                self.parsed_doc = Some(v.clone());
+                self.eval.set_doc(DocState::Ok(v));
+            }
+            Err(e) => {
+                self.parsed_doc = None;
+                let msg = e.to_string();
+                self.eval.set_doc(DocState::ParseErr(msg.clone()));
+                self.eval_state = EvalState::ParseErr(format!("(JSON parse error)\n{}", msg));
+                self.sync_result_view();
+            }
         }
     }
 
     fn evaluate(&mut self) {
         let expr = self.expr_text();
-        if expr.trim().is_empty() {
-            self.result_text.clear();
-            self.last_eval_ns = 0;
-            self.last_result_bytes = 0;
-            self.sync_result_view();
-            return;
+        self.eval.submit_expr(expr);
+    }
+
+    /// Apply a result delivered by the eval worker.
+    fn apply_eval_result(&mut self, r: eval::EvalResult) {
+        if matches!(r.state, EvalState::Ok { .. }) {
+            self.eval_count = self.eval_count.saturating_add(1);
         }
-        let Some(doc) = &self.parsed_doc else {
-            if let Some(err) = &self.parse_err {
-                self.result_text = format!("(JSON parse error)\n{}", err);
-            } else {
-                self.result_text.clear();
-            }
-            self.last_eval_ns = 0;
-            self.sync_result_view();
-            return;
-        };
-        let t0 = Instant::now();
-        match jetro::query(&expr, doc) {
-            Ok(v)  => {
-                self.result_text = serde_json::to_string_pretty(&v)
-                    .unwrap_or_else(|_| v.to_string());
-            }
-            Err(e) => self.result_text = format!("error: {}", e),
-        }
-        self.last_eval_ns = t0.elapsed().as_nanos();
-        self.last_result_bytes = self.result_text.len();
-        self.eval_count = self.eval_count.saturating_add(1);
+        self.eval_state = r.state;
         self.sync_result_view();
     }
 
@@ -188,8 +186,7 @@ impl<'a> App<'a> {
         let prev_scroll = self.result.scroll_row;
         let prev_row    = self.result.row;
         let prev_col    = self.result.col;
-        self.result = JsonEditor::from_text(&self.result_text);
-        // best-effort preserve scroll/cursor if within bounds
+        self.result = JsonEditor::from_text(self.eval_state.display_text());
         if prev_row < self.result.lines.len() {
             self.result.row = prev_row;
             self.result.col = prev_col;
@@ -300,367 +297,7 @@ fn word_bounds(s: &str, cursor: usize) -> (usize, usize) {
     (start, end)
 }
 
-// ── JSON editor with structural folding ─────────────────────────────────────
-
-struct JsonEditor {
-    lines:      Vec<String>,
-    row:        usize,
-    col:        usize,
-    scroll_row: usize,
-    folded:     HashSet<usize>, // fold header rows currently collapsed
-    view_h:     usize,          // last rendered inner height (for page-nav)
-}
-
-impl JsonEditor {
-    fn from_text(s: &str) -> Self {
-        let lines: Vec<String> = if s.is_empty() {
-            vec![String::new()]
-        } else {
-            s.split('\n').map(|l| l.to_string()).collect()
-        };
-        Self { lines, row: 0, col: 0, scroll_row: 0, folded: HashSet::new(), view_h: 20 }
-    }
-
-    fn text(&self) -> String { self.lines.join("\n") }
-
-    fn clamp_col(&mut self) {
-        let max = self.lines[self.row].chars().count();
-        if self.col > max { self.col = max; }
-    }
-
-    fn clamp_all(&mut self) {
-        if self.lines.is_empty() { self.lines.push(String::new()); }
-        if self.row >= self.lines.len() { self.row = self.lines.len() - 1; }
-        self.clamp_col();
-        let vlen = self.lines.len();
-        if self.scroll_row >= vlen { self.scroll_row = vlen.saturating_sub(1); }
-    }
-
-    fn col_byte(&self) -> usize {
-        self.lines[self.row]
-            .char_indices()
-            .nth(self.col)
-            .map(|(b, _)| b)
-            .unwrap_or(self.lines[self.row].len())
-    }
-
-    fn insert_char(&mut self, c: char) {
-        self.folded.clear();
-        let byte = self.col_byte();
-        self.lines[self.row].insert(byte, c);
-        self.col += 1;
-        self.clamp_all();
-    }
-
-    fn insert_str(&mut self, s: &str) {
-        self.folded.clear();
-        for (i, part) in s.split('\n').enumerate() {
-            if i > 0 { self.newline_raw(); }
-            let byte = self.col_byte();
-            self.lines[self.row].insert_str(byte, part);
-            self.col += part.chars().count();
-        }
-        self.clamp_all();
-    }
-
-    fn newline_raw(&mut self) {
-        let byte = self.col_byte();
-        let rest = self.lines[self.row].split_off(byte);
-        self.lines.insert(self.row + 1, rest);
-        self.row += 1;
-        self.col = 0;
-    }
-
-    fn newline(&mut self) { self.folded.clear(); self.newline_raw(); self.clamp_all(); }
-
-    fn backspace(&mut self) {
-        self.folded.clear();
-        if self.col > 0 {
-            let end = self.col_byte();
-            let prev = self.lines[self.row][..end]
-                .char_indices().last().map(|(b, _)| b).unwrap_or(0);
-            self.lines[self.row].replace_range(prev..end, "");
-            self.col -= 1;
-        } else if self.row > 0 {
-            let cur = self.lines.remove(self.row);
-            self.row -= 1;
-            self.col = self.lines[self.row].chars().count();
-            self.lines[self.row].push_str(&cur);
-        }
-        self.clamp_all();
-    }
-
-    fn delete(&mut self) {
-        self.folded.clear();
-        let len = self.lines[self.row].chars().count();
-        if self.col < len {
-            let byte = self.col_byte();
-            let next = self.lines[self.row][byte..]
-                .char_indices().nth(1)
-                .map(|(b, _)| byte + b)
-                .unwrap_or(self.lines[self.row].len());
-            self.lines[self.row].replace_range(byte..next, "");
-        } else if self.row + 1 < self.lines.len() {
-            let next = self.lines.remove(self.row + 1);
-            self.lines[self.row].push_str(&next);
-        }
-        self.clamp_all();
-    }
-
-    fn home(&mut self) { self.col = 0; }
-    fn end(&mut self)  { self.col = self.lines[self.row].chars().count(); }
-
-    fn kill_line(&mut self) {
-        self.folded.clear();
-        let len = self.lines[self.row].chars().count();
-        if self.col < len {
-            let byte = self.col_byte();
-            self.lines[self.row].truncate(byte);
-        } else if self.row + 1 < self.lines.len() {
-            let next = self.lines.remove(self.row + 1);
-            self.lines[self.row].push_str(&next);
-        }
-        self.clamp_all();
-    }
-
-    fn move_left(&mut self) {
-        if self.col > 0 { self.col -= 1; }
-        else if self.row > 0 {
-            self.row -= 1;
-            self.col = self.lines[self.row].chars().count();
-        }
-    }
-
-    fn move_right(&mut self) {
-        let len = self.lines[self.row].chars().count();
-        if self.col < len { self.col += 1; }
-        else if self.row + 1 < self.lines.len() {
-            self.row += 1;
-            self.col = 0;
-        }
-    }
-
-    fn move_up(&mut self, folds: &HashMap<usize, usize>) {
-        if self.row == 0 { self.col = 0; return; }
-        self.row -= 1;
-        // snap into header if we landed inside a collapsed range
-        for (&h, &e) in folds {
-            if self.folded.contains(&h) && self.row > h && self.row <= e {
-                self.row = h;
-                break;
-            }
-        }
-        self.clamp_col();
-    }
-
-    fn move_down(&mut self, folds: &HashMap<usize, usize>) {
-        if self.folded.contains(&self.row) {
-            if let Some(&e) = folds.get(&self.row) {
-                if e + 1 < self.lines.len() { self.row = e + 1; }
-                else { self.row = self.lines.len() - 1; }
-                self.clamp_col();
-                return;
-            }
-        }
-        if self.row + 1 < self.lines.len() {
-            self.row += 1;
-            self.clamp_col();
-        } else {
-            self.col = self.lines[self.row].chars().count();
-        }
-    }
-
-    fn page_down(&mut self, folds: &HashMap<usize, usize>) {
-        let n = self.view_h.saturating_sub(1).max(1);
-        for _ in 0..n { self.move_down(folds); }
-    }
-
-    fn page_up(&mut self, folds: &HashMap<usize, usize>) {
-        let n = self.view_h.saturating_sub(1).max(1);
-        for _ in 0..n { self.move_up(folds); }
-    }
-
-    fn toggle_fold(&mut self, folds: &HashMap<usize, usize>) {
-        if folds.contains_key(&self.row) {
-            if self.folded.contains(&self.row) { self.folded.remove(&self.row); }
-            else { self.folded.insert(self.row); }
-            return;
-        }
-        // not on a header: collapse enclosing fold
-        let mut best: Option<(usize, usize)> = None;
-        for (&h, &e) in folds {
-            if self.row > h && self.row <= e {
-                if best.map_or(true, |(bh, _)| h > bh) { best = Some((h, e)); }
-            }
-        }
-        if let Some((h, _)) = best {
-            self.folded.insert(h);
-            self.row = h;
-            self.clamp_col();
-        }
-    }
-
-    fn fold_all(&mut self, folds: &HashMap<usize, usize>) {
-        for &h in folds.keys() { self.folded.insert(h); }
-        // snap cursor to nearest enclosing header
-        let cur = self.row;
-        let mut best: Option<usize> = None;
-        for (&h, &e) in folds {
-            if cur >= h && cur <= e {
-                if best.map_or(true, |bh| h > bh) { best = Some(h); }
-            }
-        }
-        if let Some(h) = best { self.row = h; self.clamp_col(); }
-    }
-
-    fn unfold_all(&mut self) { self.folded.clear(); }
-}
-
-fn detect_folds(lines: &[String]) -> HashMap<usize, usize> {
-    let mut stack: Vec<(usize, char)> = Vec::new();
-    let mut out = HashMap::new();
-    for (i, line) in lines.iter().enumerate() {
-        let mut in_str = false;
-        let mut esc = false;
-        for c in line.chars() {
-            if esc { esc = false; continue; }
-            if in_str {
-                if c == '\\' { esc = true; }
-                else if c == '"' { in_str = false; }
-                continue;
-            }
-            match c {
-                '"' => in_str = true,
-                '{' => stack.push((i, '}')),
-                '[' => stack.push((i, ']')),
-                '}' | ']' => {
-                    if let Some((start, close)) = stack.pop() {
-                        if close == c && i > start { out.insert(start, i); }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    out
-}
-
 // ── UI ───────────────────────────────────────────────────────────────────────
-
-// palette (theme-driven)
-struct Palette {
-    theme:        ThemeArg,
-    accent:       Color,
-    accent2:      Color,
-    ok:           Color,
-    err:          Color,
-    warn:         Color,
-    muted:        Color,
-    str_:         Color,
-    key:          Color,
-    num:          Color,
-    bool_:        Color,
-    brace:        Color,
-    punct:        Color,
-    body:         Color,
-    hint:         Color,
-    cursor_line:  Color,
-    modeline_bg:  Color,
-    on_chip:      Color,
-    pane_bg:      Color, // overall canvas background
-}
-
-static PALETTE: OnceLock<Mutex<Palette>> = OnceLock::new();
-
-fn pal_color<F: Fn(&Palette) -> Color>(f: F) -> Color {
-    let g = PALETTE.get().expect("palette uninitialized").lock().unwrap();
-    f(&*g)
-}
-fn current_theme() -> ThemeArg {
-    PALETTE.get().expect("palette uninitialized").lock().unwrap().theme
-}
-fn set_palette(theme: ThemeArg) {
-    let p = build_palette(theme);
-    if let Some(slot) = PALETTE.get() {
-        *slot.lock().unwrap() = p;
-    } else {
-        let _ = PALETTE.set(Mutex::new(p));
-    }
-}
-fn toggle_theme() {
-    let new = match current_theme() {
-        ThemeArg::Dark => ThemeArg::Light,
-        ThemeArg::Light => ThemeArg::Dark,
-    };
-    set_palette(new);
-}
-fn init_palette(theme: ThemeArg) { set_palette(theme); }
-
-fn build_palette(theme: ThemeArg) -> Palette {
-    match theme {
-        ThemeArg::Dark => Palette {
-            theme,
-            accent:      Color::Rgb(0x7a, 0xa2, 0xf7),
-            accent2:     Color::Rgb(0xbb, 0x9a, 0xf7),
-            ok:          Color::Rgb(0x9e, 0xce, 0x6a),
-            err:         Color::Rgb(0xf7, 0x76, 0x8e),
-            warn:        Color::Rgb(0xe0, 0xaf, 0x68),
-            muted:       Color::Rgb(0x56, 0x5f, 0x89),
-            str_:        Color::Rgb(0x9e, 0xce, 0x6a),
-            key:         Color::Rgb(0x7d, 0xcf, 0xff),
-            num:         Color::Rgb(0xff, 0x9e, 0x64),
-            bool_:       Color::Rgb(0xbb, 0x9a, 0xf7),
-            brace:       Color::Rgb(0xc0, 0xca, 0xf5),
-            punct:       Color::Rgb(0x56, 0x5f, 0x89),
-            body:        Color::Rgb(0xc0, 0xca, 0xf5),
-            hint:        Color::Rgb(0xa9, 0xb1, 0xd6),
-            cursor_line: Color::Rgb(0x29, 0x2e, 0x42),
-            modeline_bg: Color::Rgb(0x1a, 0x1b, 0x26),
-            on_chip:     Color::Black,
-            pane_bg:     Color::Reset,
-        },
-        ThemeArg::Light => Palette {
-            theme,
-            accent:      Color::Rgb(0x1e, 0x66, 0xf5),  // soft blue
-            accent2:     Color::Rgb(0xfa, 0xa3, 0x4c),  // light orange (was purple)
-            ok:          Color::Rgb(0x40, 0xa0, 0x2b),
-            err:         Color::Rgb(0xd2, 0x0f, 0x39),
-            warn:        Color::Rgb(0xdf, 0x8e, 0x1d),
-            muted:       Color::Rgb(0x9c, 0x90, 0x7a),  // warm gray
-            str_:        Color::Rgb(0x40, 0xa0, 0x2b),
-            key:         Color::Rgb(0x04, 0xa5, 0xe5),
-            num:         Color::Rgb(0xfe, 0x64, 0x0b),
-            bool_:       Color::Rgb(0xfa, 0xa3, 0x4c),
-            brace:       Color::Rgb(0x4c, 0x4a, 0x40),
-            punct:       Color::Rgb(0x9c, 0x90, 0x7a),
-            body:        Color::Rgb(0x4c, 0x4a, 0x40),
-            hint:        Color::Rgb(0x6c, 0x66, 0x55),
-            cursor_line: Color::Rgb(0xf0, 0xe6, 0xc8),  // warmer cream highlight
-            modeline_bg: Color::Rgb(0xf2, 0xe7, 0xc8),  // deeper cream for modeline
-            on_chip:     Color::Rgb(0xfb, 0xf3, 0xde),  // light text on colored chips
-            pane_bg:     Color::Rgb(0xfb, 0xf3, 0xde),  // cream canvas
-        },
-    }
-}
-
-fn c_accent()  -> Color { pal_color(|p| p.accent) }
-fn c_accent2() -> Color { pal_color(|p| p.accent2) }
-fn c_ok()      -> Color { pal_color(|p| p.ok) }
-fn c_err()     -> Color { pal_color(|p| p.err) }
-fn c_warn()    -> Color { pal_color(|p| p.warn) }
-fn c_muted()   -> Color { pal_color(|p| p.muted) }
-fn c_str()     -> Color { pal_color(|p| p.str_) }
-fn c_key()     -> Color { pal_color(|p| p.key) }
-fn c_num()     -> Color { pal_color(|p| p.num) }
-fn c_bool()    -> Color { pal_color(|p| p.bool_) }
-fn c_brace()   -> Color { pal_color(|p| p.brace) }
-fn c_punct()   -> Color { pal_color(|p| p.punct) }
-fn c_body()        -> Color { pal_color(|p| p.body) }
-fn c_hint()        -> Color { pal_color(|p| p.hint) }
-fn c_cursor_line() -> Color { pal_color(|p| p.cursor_line) }
-fn c_modeline_bg() -> Color { pal_color(|p| p.modeline_bg) }
-fn c_pane_bg()     -> Color { pal_color(|p| p.pane_bg) }
-fn c_on_chip()     -> Color { pal_color(|p| p.on_chip) }
 
 fn draw(frame: &mut Frame, app: &mut App) {
     let size = frame.area();
@@ -891,9 +528,9 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         Focus::Expr   => Span::styled(" EXPR ",   Style::default().bg(c_accent2()).fg(Color::Black).bold()),
         Focus::Result => Span::styled(" RESULT ", Style::default().bg(c_ok()).fg(Color::Black).bold()),
     };
-    let state = if app.parse_err.is_some() {
+    let state = if app.eval_state.is_parse_err() {
         Span::styled(" ● parse error ", Style::default().fg(c_err()).bold())
-    } else if app.result_text.starts_with("error:") {
+    } else if app.eval_state.is_err() {
         Span::styled(" ● eval error ", Style::default().fg(c_warn()).bold())
     } else {
         Span::styled(" ● ready ", Style::default().fg(c_ok()).bold())
@@ -918,9 +555,10 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_json_pane(frame: &mut Frame, area: Rect, app: &mut App) {
     let focused = matches!(app.focus, Focus::Json);
-    let (title_icon_color, badge) = match &app.parse_err {
-        Some(_) => (c_err(), Span::styled(" ✗ parse ", Style::default().bg(c_err()).fg(Color::Black).bold())),
-        None    => (c_ok(),  Span::styled(" ✓ valid ", Style::default().bg(c_ok()).fg(Color::Black).bold())),
+    let (title_icon_color, badge) = if app.eval_state.is_parse_err() {
+        (c_err(), Span::styled(" ✗ parse ", Style::default().bg(c_err()).fg(Color::Black).bold()))
+    } else {
+        (c_ok(),  Span::styled(" ✓ valid ", Style::default().bg(c_ok()).fg(Color::Black).bold()))
     };
 
     let folds_count = detect_folds(&app.json.lines).len();
@@ -1042,16 +680,18 @@ fn draw_editor(frame: &mut Frame, area: Rect, ed: &mut JsonEditor, block: Block,
 
 fn draw_result_pane(frame: &mut Frame, area: Rect, app: &mut App) {
     let focused = matches!(app.focus, Focus::Result);
-    let is_err = app.result_text.starts_with("error:") || app.result_text.starts_with("(JSON parse error)");
+    let is_err = app.eval_state.is_err();
+    let display = app.eval_state.display_text();
+    let is_empty = display.is_empty();
     let badge = if is_err {
         Span::styled(" ! error ", Style::default().bg(c_err()).fg(Color::Black).bold())
-    } else if app.result_text.is_empty() {
+    } else if is_empty {
         Span::styled(" ∅ empty ", Style::default().bg(c_muted()).fg(Color::Black).bold())
     } else {
         Span::styled(" » ok ", Style::default().bg(c_ok()).fg(Color::Black).bold())
     };
 
-    let folds_count = if !is_err && !app.result_text.is_empty() {
+    let folds_count = if !is_err && !is_empty {
         detect_folds(&app.result.lines).len()
     } else { 0 };
     let folded_count = app.result.folded.len();
@@ -1076,12 +716,12 @@ fn draw_result_pane(frame: &mut Frame, area: Rect, app: &mut App) {
     let block = pane_block(title, focused);
 
     if is_err {
-        let body: Vec<Line> = app.result_text.lines().map(|l| {
+        let body: Vec<Line> = display.lines().map(|l| {
             Line::from(Span::styled(l.to_string(), Style::default().fg(c_err())))
         }).collect();
         let para = Paragraph::new(body).block(block).wrap(Wrap { trim: false });
         frame.render_widget(para, area);
-    } else if app.result_text.is_empty() {
+    } else if is_empty {
         let body = vec![
             Line::from(""),
             Line::from(Span::styled("  (type an expression below to query the JSON)",
@@ -1164,26 +804,27 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
 
     // status indicators
     let mut indicators = String::new();
-    if app.parse_err.is_some() { indicators.push('!'); }
+    if app.eval_state.is_parse_err() { indicators.push('!'); }
     else if app.parsed_doc.is_some() { indicators.push('*'); }
     else { indicators.push('-'); }
     if app.popup_open { indicators.push('C'); }
     if !app.json.folded.is_empty() || !app.result.folded.is_empty() { indicators.push('F'); }
     if app.chord.is_some() { indicators.push('K'); }
 
-    let eval_str = if app.last_eval_ns == 0 {
+    let eval_ns = app.eval_state.eval_ns();
+    let eval_str = if eval_ns == 0 {
         "—".to_string()
-    } else if app.last_eval_ns < 1_000 {
-        format!("{}ns", app.last_eval_ns)
-    } else if app.last_eval_ns < 1_000_000 {
-        format!("{:.1}µs", app.last_eval_ns as f64 / 1_000.0)
-    } else if app.last_eval_ns < 1_000_000_000 {
-        format!("{:.2}ms", app.last_eval_ns as f64 / 1_000_000.0)
+    } else if eval_ns < 1_000 {
+        format!("{}ns", eval_ns)
+    } else if eval_ns < 1_000_000 {
+        format!("{:.1}µs", eval_ns as f64 / 1_000.0)
+    } else if eval_ns < 1_000_000_000 {
+        format!("{:.2}ms", eval_ns as f64 / 1_000_000.0)
     } else {
-        format!("{:.2}s", app.last_eval_ns as f64 / 1_000_000_000.0)
+        format!("{:.2}s", eval_ns as f64 / 1_000_000_000.0)
     };
 
-    let bytes_str = format_bytes(app.last_result_bytes);
+    let bytes_str = format_bytes(app.eval_state.bytes());
 
     let sep = || Span::styled("  ─  ", Style::default().fg(c_muted()));
     let dim = |s: String| Span::styled(s, Style::default().fg(txt));
@@ -1425,10 +1066,6 @@ fn highlight_expr_spans(line: &str) -> Vec<Span<'static>> {
 
 // ── JSON syntax highlight ────────────────────────────────────────────────────
 
-fn highlight_json(s: &str) -> Vec<Line<'static>> {
-    s.lines().map(|l| Line::from(highlight_json_spans(l))).collect()
-}
-
 fn highlight_json_spans(line: &str) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let bytes = line.as_bytes();
@@ -1513,8 +1150,22 @@ fn run<'a>(app: &mut App<'a>) -> Result<()> {
 }
 
 fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
+    let mut dirty = true;
     loop {
-        terminal.draw(|f| draw(f, app))?;
+        // Drain any results delivered by the eval worker since last redraw.
+        while let Some(r) = app.eval.poll_latest() {
+            app.apply_eval_result(r);
+            dirty = true;
+        }
+
+        if dirty {
+            terminal.draw(|f| draw(f, app))?;
+            dirty = false;
+        }
+
+        if !event::poll(Duration::from_millis(40))? {
+            continue;
+        }
 
         let key = match event::read()? {
             Event::Key(k) => k,
@@ -1532,11 +1183,17 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(
                     Focus::Result => { /* read-only */ }
                 }
                 app.evaluate();
+                dirty = true;
+                continue;
+            }
+            Event::Resize(_, _) => {
+                dirty = true;
                 continue;
             }
             _ => continue,
         };
         if key.kind != event::KeyEventKind::Press { continue; }
+        dirty = true;
 
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt  = key.modifiers.contains(KeyModifiers::ALT);
@@ -1615,7 +1272,7 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(
                         app.evaluate();
                     }
                     Focus::Result => {
-                        app.result_text.clear();
+                        app.eval_state = EvalState::Empty;
                         app.result = JsonEditor::from_text("");
                     }
                 }
@@ -1657,7 +1314,7 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(
                 let text = match app.focus {
                     Focus::Json   => app.json.text(),
                     Focus::Expr   => app.expr_area.lines().join("\n"),
-                    Focus::Result => app.result_text.clone(),
+                    Focus::Result => app.eval_state.display_text().to_string(),
                 };
                 copy_to_clipboard(&text);
                 continue;
@@ -2069,7 +1726,7 @@ fn run_command(app: &mut App, name: &str) -> bool {
                 app.evaluate();
             }
             Focus::Result => {
-                app.result_text.clear();
+                app.eval_state = EvalState::Empty;
                 app.result = JsonEditor::from_text("");
             }
         },
@@ -2077,7 +1734,7 @@ fn run_command(app: &mut App, name: &str) -> bool {
             let text = match app.focus {
                 Focus::Json   => app.json.text(),
                 Focus::Expr   => app.expr_area.lines().join("\n"),
-                Focus::Result => app.result_text.clone(),
+                Focus::Result => app.eval_state.display_text().to_string(),
             };
             copy_to_clipboard(&text);
         }
@@ -2277,12 +1934,31 @@ fn handle_expr(app: &mut App, key: KeyEvent) -> Result<()> {
         return Ok(());
     }
 
+    // navigation keys: move cursor only, no recompile/reeval
+    if is_nav_key(&key) {
+        app.expr_area.input(key);
+        return Ok(());
+    }
+
     // regular input — feed textarea (Enter inserts newline), refresh completions
     app.expr_area.input(key);
     app.refresh_completions();
     app.popup_open = !app.candidates.is_empty();
     app.evaluate();
     Ok(())
+}
+
+fn is_nav_key(key: &KeyEvent) -> bool {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt  = key.modifiers.contains(KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
+        | KeyCode::Home | KeyCode::End
+        | KeyCode::PageUp | KeyCode::PageDown => true,
+        KeyCode::Char(c) if ctrl => matches!(c, 'a' | 'b' | 'e' | 'f' | 'n' | 'p' | 'v'),
+        KeyCode::Char(c) if alt  => matches!(c, 'b' | 'f' | 'v'),
+        _ => false,
+    }
 }
 
 fn reformat_expr(app: &mut App) {

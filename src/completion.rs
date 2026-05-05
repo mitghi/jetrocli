@@ -5,15 +5,59 @@
 //!   - Builtin method names (receiver-type aware)
 //!   - Snippets for common forms (lambda, projection)
 
-use jetro::eval::builtins;
-use jetro_core::schema::Shape;
+use crate::shape::Shape;
+
+mod builtins {
+    /// Hardcoded list of jetro builtin method names. Kept in sync manually
+    /// because `jetro_core` no longer exposes a public registry accessor.
+    pub fn all_names() -> &'static [&'static str] {
+        &[
+            "abs", "accumulate", "all", "any", "append", "avg",
+            "batch", "byte_len", "bytes",
+            "camel_case", "capitalize", "captures", "captures_all", "ceil", "center", "chars",
+            "chars_of", "chunk", "collect", "compact", "contains", "contains_all",
+            "contains_any", "count", "count_by", "cummax", "cummin",
+            "dedent", "deep_find", "deep_like", "deep_merge", "deep_shape", "defaults",
+            "del_path", "del_paths", "diff", "diff_window", "distinct", "drop_while", "dropwhile",
+            "ends_with", "entries", "enumerate", "equi_join", "explode",
+            "fanout", "filter", "filter_keys", "filter_values", "find", "find_all",
+            "find_index", "first", "flat_map", "flatten", "flatten_keys", "floor",
+            "from_json", "from_pairs",
+            "get_path", "group_by", "group_shape",
+            "has", "has_path", "html_escape", "html_unescape",
+            "implode", "includes", "indent", "index", "index_by", "index_of",
+            "indices_of", "indices_where", "intersect", "invert",
+            "is_alpha", "is_ascii", "is_blank", "is_numeric",
+            "join", "kebab_case", "keys",
+            "lag", "last", "last_index_of", "lead", "len", "lines", "lower",
+            "map", "match_all", "match_first", "matches", "max", "max_by", "merge",
+            "min", "min_by", "missing",
+            "nth",
+            "omit",
+            "pad_left", "pad_right", "pairwise", "parse_bool", "parse_float", "parse_int",
+            "partition", "pascal_case", "pct_change", "pick", "pivot", "prepend",
+            "re_match", "rec", "remove", "rename", "repeat", "repeat_str",
+            "replace", "replace_all", "replace_all_re", "replace_re", "reverse",
+            "reverse_str", "rolling_avg", "rolling_max", "rolling_min", "rolling_sum", "round",
+            "scan", "schema", "set", "set_path", "slice", "snake_case", "sort", "split",
+            "split_re", "starts_with", "strip_prefix", "strip_suffix", "sum",
+            "take_while", "takewhile", "title_case", "to_bool", "to_csv", "to_json",
+            "to_number", "to_pairs", "to_string", "to_tsv", "trace_path",
+            "transform_keys", "transform_values", "trim", "trim_left", "trim_right", "type",
+            "union", "unique", "unique_by", "unflatten_keys", "update", "upper",
+            "url_decode", "url_encode",
+            "values",
+            "walk", "walk_pre", "window", "words",
+            "zip", "zip_longest", "zip_shape", "zscore",
+        ]
+    }
+}
 use serde_json::Value;
 
 #[derive(Debug, Clone)]
 pub struct Candidate {
     pub text:  String,
     pub kind:  CandKind,
-    pub hint:  String,
     pub doc:   String, // multi-line help: signature, summary, example
 }
 
@@ -48,7 +92,6 @@ pub fn complete(expr: &str, cursor: usize, doc: &Value) -> Vec<Candidate> {
                         out.push(Candidate {
                             text: k.to_string(),
                             kind: CandKind::Field,
-                            hint: shape_hint(sub),
                             doc: field_doc(k, sub),
                         });
                     }
@@ -62,7 +105,6 @@ pub fn complete(expr: &str, cursor: usize, doc: &Value) -> Vec<Candidate> {
                         out.push(Candidate {
                             text: name.to_string(),
                             kind: CandKind::Field,
-                            hint: format!("elem.{} (auto-unwrap)", name),
                             doc: format!(
                                 "{}  (element field)\n\n\
                                  When receiver is an array of objects, bare field names\n\
@@ -81,7 +123,6 @@ pub fn complete(expr: &str, cursor: usize, doc: &Value) -> Vec<Candidate> {
                 out.push(Candidate {
                     text: format!("{}()", name),
                     kind: CandKind::Method,
-                    hint: method_hint(name),
                     doc:  method_doc(name),
                 });
             }
@@ -94,7 +135,6 @@ pub fn complete(expr: &str, cursor: usize, doc: &Value) -> Vec<Candidate> {
                         out.push(Candidate {
                             text: k.to_string(),
                             kind: CandKind::Field,
-                            hint: "element field".into(),
                             doc:  format!("{}\n\nElement field of the current receiver.", k),
                         });
                     }
@@ -105,7 +145,6 @@ pub fn complete(expr: &str, cursor: usize, doc: &Value) -> Vec<Candidate> {
                     out.push(Candidate {
                         text: kw.into(),
                         kind: CandKind::Keyword,
-                        hint: "keyword".into(),
                         doc:  keyword_doc(kw),
                     });
                 }
@@ -113,7 +152,6 @@ pub fn complete(expr: &str, cursor: usize, doc: &Value) -> Vec<Candidate> {
             out.push(Candidate {
                 text: "lambda x: ".into(),
                 kind: CandKind::Snippet,
-                hint: "lambda snippet".into(),
                 doc: "lambda <param>: <body>\n\n\
                       Anonymous function. Used as predicate or projection in\n\
                       methods like filter, map, sort.\n\n\
@@ -126,7 +164,6 @@ pub fn complete(expr: &str, cursor: usize, doc: &Value) -> Vec<Candidate> {
                     out.push(Candidate {
                         text: t.into(),
                         kind: CandKind::Keyword,
-                        hint: "start".into(),
                         doc:  keyword_doc(t),
                     });
                 }
@@ -138,7 +175,6 @@ pub fn complete(expr: &str, cursor: usize, doc: &Value) -> Vec<Candidate> {
                         out.push(Candidate {
                             text: format!("$.{}", k),
                             kind: CandKind::Field,
-                            hint: shape_hint(sub),
                             doc:  field_doc(k, sub),
                         });
                     }
@@ -274,7 +310,7 @@ fn resolve_shape(root: &Shape, path: &[PathSeg]) -> Option<Shape> {
         cur = match (cur.as_ref(), seg) {
             (Some(s), PathSeg::Field(f))   => s.field(f).cloned(),
             (Some(s), PathSeg::Index)      => s.element().cloned(),
-            (Some(s), PathSeg::Method(m))  => apply_method_shape(s, m),
+            (Some(s), PathSeg::Method(m))  => apply_method_shape(s, &m),
             _ => None,
         };
     }
@@ -947,31 +983,6 @@ fn method_doc(name: &str) -> String {
         Some((sig, summary, example)) =>
             format!("{}\n\n{}\n\nExample:\n  {}", sig, summary, example),
         None => format!("{}(…)\n\njetro builtin.", name),
-    }
-}
-
-fn method_hint(name: &str) -> String {
-    match name {
-        "filter"    => "filter(pred) → array".into(),
-        "map"       => "map(expr) → array".into(),
-        "sort"      => "sort([key | -key | lambda]) → array".into(),
-        "sum"       => "sum([field]) → number".into(),
-        "avg"       => "avg([field]) → number".into(),
-        "count"     => "count([pred]) → int".into(),
-        "group_by"  => "group_by(key) → {key: [items]}".into(),
-        "index_by"  => "index_by(key) → {key: item}".into(),
-        "len"       => "len() → int".into(),
-        "keys"      => "keys() → [string]".into(),
-        "values"    => "values() → [any]".into(),
-        "entries"   => "entries() → [[k,v]]".into(),
-        "upper"     => "upper() → string".into(),
-        "lower"     => "lower() → string".into(),
-        "split"     => "split(sep) → [string]".into(),
-        "join"      => "join(sep) → string".into(),
-        "flatten"   => "flatten([n]) → array".into(),
-        "first"     => "first() → any".into(),
-        "last"      => "last() → any".into(),
-        _           => format!("{}(…)", name),
     }
 }
 
