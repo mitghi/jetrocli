@@ -12,17 +12,17 @@ mod builtins {
     /// because `jetro_core` no longer exposes a public registry accessor.
     pub fn all_names() -> &'static [&'static str] {
         &[
-            "abs", "accumulate", "all", "any", "append", "avg",
-            "batch", "byte_len", "bytes",
+            "abs", "accumulate", "all", "any", "append", "approx_count_distinct", "avg",
+            "byte_len", "bytes",
             "camel_case", "capitalize", "captures", "captures_all", "ceil", "center", "chars",
-            "chars_of", "chunk", "collect", "compact", "contains", "contains_all",
+            "chars_of", "chunk", "collect", "compact", "contains_all",
             "contains_any", "count", "count_by", "cummax", "cummin",
             "dedent", "deep_find", "deep_like", "deep_merge", "deep_shape", "defaults",
-            "del_path", "del_paths", "diff", "diff_window", "distinct", "drop_while", "dropwhile",
+            "del_path", "del_paths", "diff", "diff_window", "drop_while",
             "ends_with", "entries", "enumerate", "equi_join", "explode",
             "fanout", "filter", "filter_keys", "filter_values", "find", "find_all",
-            "find_index", "first", "flat_map", "flatten", "flatten_keys", "floor",
-            "from_json", "from_pairs",
+            "find_first", "find_index", "find_one", "first", "flat_map", "flatten", "flatten_keys", "floor",
+            "from_base64", "from_json", "from_pairs",
             "get_path", "group_by", "group_shape",
             "has", "has_path", "html_escape", "html_unescape",
             "implode", "includes", "indent", "index", "index_by", "index_of",
@@ -33,15 +33,15 @@ mod builtins {
             "map", "match_all", "match_first", "matches", "max", "max_by", "merge",
             "min", "min_by", "missing",
             "nth",
-            "omit",
+            "omit", "or",
             "pad_left", "pad_right", "pairwise", "parse_bool", "parse_float", "parse_int",
             "partition", "pascal_case", "pct_change", "pick", "pivot", "prepend",
-            "re_match", "rec", "remove", "rename", "repeat", "repeat_str",
+            "re_match", "rec", "remove", "rename", "repeat",
             "replace", "replace_all", "replace_all_re", "replace_re", "reverse",
             "reverse_str", "rolling_avg", "rolling_max", "rolling_min", "rolling_sum", "round",
-            "scan", "schema", "set", "set_path", "slice", "snake_case", "sort", "split",
+            "scan", "schema", "set", "set_path", "skip", "slice", "snake_case", "sort", "split",
             "split_re", "starts_with", "strip_prefix", "strip_suffix", "sum",
-            "take_while", "takewhile", "title_case", "to_bool", "to_csv", "to_json",
+            "take", "take_while", "title_case", "to_base64", "to_bool", "to_csv", "to_json",
             "to_number", "to_pairs", "to_string", "to_tsv", "trace_path",
             "transform_keys", "transform_values", "trim", "trim_left", "trim_right", "type",
             "union", "unique", "unique_by", "unflatten_keys", "update", "upper",
@@ -140,7 +140,8 @@ pub fn complete(expr: &str, cursor: usize, doc: &Value) -> Vec<Candidate> {
                     }
                 }
             }
-            for kw in ["lambda", "let", "not", "and", "or", "kind", "when", "for", "in", "if"] {
+            for kw in ["lambda", "let", "not", "and", "or", "kind", "is", "as", "when",
+                       "for", "in", "if", "else", "try", "match", "with"] {
                 if kw.starts_with(prefix) {
                     out.push(Candidate {
                         text: kw.into(),
@@ -159,7 +160,7 @@ pub fn complete(expr: &str, cursor: usize, doc: &Value) -> Vec<Candidate> {
             });
         }
         Ctx::Root => {
-            for t in ["$", "@", "let", "patch", "[", "{"] {
+            for t in ["$", "@", "let", "patch", "match", "try", "[", "{"] {
                 if t.starts_with(prefix) {
                     out.push(Candidate {
                         text: t.into(),
@@ -167,6 +168,22 @@ pub fn complete(expr: &str, cursor: usize, doc: &Value) -> Vec<Candidate> {
                         doc:  keyword_doc(t),
                     });
                 }
+            }
+            if "match".starts_with(prefix) {
+                out.push(Candidate {
+                    text: "match $ with { _ -> null }".into(),
+                    kind: CandKind::Snippet,
+                    doc:  "match <scrutinee> with { <pat> -> <body>, … }\n\n\
+                           Pattern match expression.\n\n\
+                           Example:\n  match $.event with {\n    {kind: \"click\"} -> 1,\n    _ -> 0\n  }".into(),
+                });
+            }
+            if "try".starts_with(prefix) {
+                out.push(Candidate {
+                    text: "try $ else null".into(),
+                    kind: CandKind::Snippet,
+                    doc:  "try <body> else <default>\n\nFallback expression.\n\nExample:\n  try $.user.email else \"unknown\"".into(),
+                });
             }
             if let Some(obj_keys) = object_keys(Some(&shape)) {
                 for k in obj_keys {
@@ -322,11 +339,12 @@ fn apply_method_shape(s: &Shape, name: &str) -> Option<Shape> {
     let empty_obj = || Shape::Object(Default::default());
     match name {
         // element extraction
-        "first" | "last" | "nth" | "find" | "index"
+        "first" | "last" | "nth" | "find" | "find_first" | "find_one" | "index"
         | "min_by" | "max_by" => s.element().cloned(),
         // array → array (same element type)
-        "filter" | "sort" | "reverse" | "unique" | "unique_by" | "distinct"
-        | "compact" | "take_while" | "takewhile" | "drop_while" | "dropwhile"
+        "filter" | "sort" | "reverse" | "unique" | "unique_by"
+        | "compact" | "take" | "skip"
+        | "take_while" | "drop_while"
         | "enumerate" | "accumulate" | "append" | "prepend" | "remove"
         | "diff" | "intersect" | "union" | "slice" | "find_all"
         | "collect" | "flatten" | "explode"
@@ -348,8 +366,8 @@ fn apply_method_shape(s: &Shape, name: &str) -> Option<Shape> {
         "captures" | "match_all"      => Some(arr_of(Shape::Str)),
         "captures_all"                => Some(arr_of(arr_of(Shape::Str))),
         "match_first"                 => Some(Shape::Str),
-        "replace_re" | "replace_all_re" | "repeat_str" | "reverse_str"
-        | "center"                    => Some(Shape::Str),
+        "replace_re" | "replace_all_re" | "reverse_str"
+        | "center" | "to_base64" | "from_base64" => Some(Shape::Str),
         "split_re"                    => Some(arr_of(Shape::Str)),
         // case conversions
         "camel_case" | "snake_case" | "kebab_case" | "pascal_case"
@@ -360,7 +378,7 @@ fn apply_method_shape(s: &Shape, name: &str) -> Option<Shape> {
         "parse_int" | "parse_float" => Some(Shape::Float),
         "parse_bool" => Some(Shape::Bool),
         // array-of-array
-        "window" | "chunk" | "batch" | "pairwise" | "partition" | "zip" | "zip_longest" =>
+        "window" | "chunk" | "pairwise" | "partition" | "zip" | "zip_longest" =>
             Some(arr_of(s.clone())),
         // map: can't infer element, mark Unknown
         "map" | "flat_map" | "fanout" | "transform_values"
@@ -383,11 +401,14 @@ fn apply_method_shape(s: &Shape, name: &str) -> Option<Shape> {
         | "filter_keys" | "filter_values" | "flatten_keys" | "unflatten_keys"
         | "set" | "update" | "group_by" | "count_by" | "index_by" => Some(empty_obj()),
         // numeric results
-        "len" | "count" | "index_of" | "last_index_of" => Some(Shape::Int),
+        "len" | "count" | "index_of" | "last_index_of"
+        | "approx_count_distinct" => Some(Shape::Int),
+        // coalesce: keep receiver's shape
+        "or" => Some(s.clone()),
         "sum" | "avg" | "min" | "max" | "abs" | "round" | "ceil" | "floor"
         | "to_number" => Some(Shape::Float),
         // boolean results
-        "any" | "all" | "contains" | "includes" | "has" | "has_path"
+        "any" | "all" | "includes" | "has" | "has_path"
         | "starts_with" | "ends_with" | "matches" | "to_bool" => Some(Shape::Bool),
         // string results
         "upper" | "lower" | "capitalize" | "title_case" | "trim"
@@ -451,18 +472,22 @@ fn method_applies(name: &str, recv: &Option<&Shape>) -> bool {
     let is_str = matches!(s, Shape::Str);
     let arr_only  = ["filter","map","flat_map","sort","flatten","first","last","nth",
                      "append","prepend","remove","diff","intersect","union","enumerate",
-                     "window","chunk","batch","take_while","takewhile","drop_while","dropwhile",
+                     "window","chunk","take","skip",
+                     "take_while","drop_while",
                      "accumulate","partition","zip","zip_longest","pairwise","reverse","unique",
-                     "unique_by","distinct","compact","sum","avg","count","count_by","group_by",
+                     "unique_by","compact","sum","avg","count","count_by","group_by",
                      "index_by","min","max","min_by","max_by","any","all","equi_join","explode",
-                     "fanout","find","find_all","find_index","indices_of","indices_where",
+                     "fanout","find","find_all","find_first","find_one","find_index",
+                     "indices_of","indices_where","approx_count_distinct",
                      "contains_all","contains_any","rolling_sum","rolling_avg","rolling_min",
                      "rolling_max","cummin","cummax","diff_window","pct_change","lag","lead",
                      "zscore","collect","index"];
     let str_only  = ["upper","lower","capitalize","title_case","camel_case","snake_case",
-                     "kebab_case","pascal_case","trim","trim_left","trim_right","lines","words",
+                     "kebab_case","pascal_case","trim","trim_left","trim_right",
+                     "lines","words",
                      "chars","to_number","to_bool","url_encode","url_decode","html_escape",
-                     "html_unescape","repeat","repeat_str","reverse_str","pad_left","pad_right",
+                     "html_unescape","to_base64","from_base64",
+                     "repeat","reverse_str","pad_left","pad_right",
                      "center","starts_with","ends_with","replace","replace_all","replace_re",
                      "replace_all_re","split","split_re","strip_prefix","strip_suffix","slice",
                      "indent","dedent","matches","scan","captures","captures_all","match_first",
@@ -515,6 +540,18 @@ fn keyword_doc(kw: &str) -> String {
         "for"  => "for <x> in <coll>: <expr> — comprehension.".into(),
         "in"   => "<x> in <coll> — membership test.".into(),
         "if"   => "if <cond>: <a> else: <b> — conditional.".into(),
+        "else" => "else — alternative branch (paired with `if` or `try`).".into(),
+        "is"   => "<expr> is <kind> — runtime kind test (alias of `kind`).\n\nExample:\n  $.value is string".into(),
+        "as"   => "<expr> as <kind> — coerce to kind (when applicable).".into(),
+        "try"  => "try <body> else <default>\n\nEvaluate body; on error / missing fall back to default.\n\nExample:\n  try $.user.email else \"unknown\"".into(),
+        "match" => "match <scrutinee> with { <pat> -> <body>, … }\n\n\
+                    Pattern match. Patterns: literals, ranges (1..10, 1..=10), bindings (x),\n\
+                    wildcards (_), kind tests (x: string), object {k: pat, ...}, array\n\
+                    [a, b, ...rest], or-patterns (a | b), guards (pat when <cond>).\n\n\
+                    Example:\n  match $.event with {\n    {kind: \"click\", x: x, y: y} -> [x, y],\n    {kind: \"key\", code: c} when c > 0 -> c,\n    _ -> null\n  }\n\n\
+                    Deep variants:\n  $..match { pat -> body }      — collect all matching descendants\n  $..match! { pat -> body }     — first matching descendant only".into(),
+        "with"  => "with — separator between `match` scrutinee and arms.\n\n\
+                    Example:\n  match $.x with { 0 -> \"zero\", n -> n }".into(),
         "["    => "[ ... ] — array literal or index.".into(),
         "{"    => "{ ... } — object literal.".into(),
         _ => format!("{}  (keyword)", kw),
@@ -541,14 +578,14 @@ fn method_doc(name: &str) -> String {
         "sort" => Some((
             "sort([key | lambda]) → array",
             "Stable sort. Optional key expression or lambda; prefix with - for descending.",
-            "$.books.sort(.price)\n$.books.sort(lambda b: -b.year)",
+            "$.books.sort(.price)",
         )),
         "reverse" => Some((
             "reverse() → array",
             "Reverse element order.",
             "$.items.reverse()",
         )),
-        "unique" | "distinct" => Some((
+        "unique" => Some((
             "unique() → array",
             "Remove duplicate elements (preserves first occurrence).",
             "$.tags.unique()",
@@ -567,6 +604,16 @@ fn method_doc(name: &str) -> String {
             "nth(i) → any",
             "Element at index i (negative counts from end).",
             "$.books.nth(0)",
+        )),
+        "take" => Some((
+            "take(n) → array",
+            "First n elements (streaming prefix).",
+            "$.events.take(10)",
+        )),
+        "skip" => Some((
+            "skip(n) → array",
+            "Drop first n elements; emit the rest.",
+            "$.events.skip(10)",
         )),
         "take_while" => Some((
             "take_while(pred) → array",
@@ -593,7 +640,7 @@ fn method_doc(name: &str) -> String {
             "Sliding windows of size n.",
             "$.nums.window(3)",
         )),
-        "chunk" | "batch" => Some((
+        "chunk" => Some((
             "chunk(n) → array",
             "Partition into contiguous chunks of size n.",
             "$.items.chunk(2)",
@@ -642,6 +689,11 @@ fn method_doc(name: &str) -> String {
             "any(pred) → bool",
             "True if any element matches pred.",
             "$.books.any(.price > 100)",
+        )),
+        "approx_count_distinct" => Some((
+            "approx_count_distinct() → int",
+            "Approximate distinct count (HyperLogLog).",
+            "$.events.approx_count_distinct()",
         )),
         "all" => Some((
             "all(pred) → bool",
@@ -774,10 +826,10 @@ fn method_doc(name: &str) -> String {
         "to_number" => Some(("to_number() → number", "Parse string as number.", "$.price.to_number()")),
         "to_bool"   => Some(("to_bool() → bool", "Parse string as boolean.", "$.flag.to_bool()")),
         "len" => Some(("len() → int", "Length of string, array, or object.", "$.books.len()")),
-        "contains" | "includes" | "has" => Some((
-            "contains(x) → bool",
+        "includes" | "has" => Some((
+            "includes(x) → bool",
             "Membership test: substring in string, element in array, key in object.",
-            "$.tags.contains(\"sci-fi\")",
+            "$.tags.includes(\"sci-fi\")",
         )),
         "index_of" => Some((
             "index_of(x) → int",
@@ -796,8 +848,18 @@ fn method_doc(name: &str) -> String {
         )),
         "find_all" => Some((
             "find_all(pred) → array",
-            "All elements matching pred (alias of filter for arrays).",
+            "All elements matching pred.",
             "$.users.find_all(.active)",
+        )),
+        "find_first" => Some((
+            "find_first(pred) → any",
+            "First element matching pred, or null. Streaming variant of find.",
+            "$.users.find_first(.role == \"admin\")",
+        )),
+        "find_one" => Some((
+            "find_one(pred) → any",
+            "Single element matching pred (errors if more than one).",
+            "$.users.find_one(.id == 42)",
         )),
         "append" => Some((
             "append(x) → array",
@@ -844,16 +906,6 @@ fn method_doc(name: &str) -> String {
             "Materialize lazy sequence into array.",
             "$.stream.collect()",
         )),
-        "takewhile" => Some((
-            "takewhile(pred) → array",
-            "Alias of take_while.",
-            "$.nums.takewhile(@ < 10)",
-        )),
-        "dropwhile" => Some((
-            "dropwhile(pred) → array",
-            "Alias of drop_while.",
-            "$.nums.dropwhile(@ < 10)",
-        )),
         "explode" => Some((
             "explode() → array",
             "Flatten nested arrays into rows (cartesian-like expansion).",
@@ -894,6 +946,11 @@ fn method_doc(name: &str) -> String {
         "schema" => Some(("schema() → schema", "Inferred schema of current value.", "$.schema()")),
         "type"   => Some(("type() → string", "Runtime type name: string|number|array|object|bool|null.", "$.value.type()")),
         "missing" => Some(("missing([keys]) → array", "List required keys missing from object.", "$.user.missing([\"id\",\"email\"])")),
+        "or" => Some((
+            "or(default) → any",
+            "Coalesce: returns receiver unless null/missing, else default.",
+            "$.user.email.or(\"unknown@example.com\")",
+        )),
         "trim_left"  => Some(("trim_left() → string", "Strip leading whitespace.", "$.s.trim_left()")),
         "trim_right" => Some(("trim_right() → string", "Strip trailing whitespace.", "$.s.trim_right()")),
         "lines" => Some(("lines() → [string]", "Split string on newlines.", "$.text.lines()")),
@@ -908,6 +965,8 @@ fn method_doc(name: &str) -> String {
         "strip_suffix" => Some(("strip_suffix(s) → string", "Remove trailing suffix if present.", "$.file.strip_suffix(\".json\")")),
         "url_encode"   => Some(("url_encode() → string", "Percent-encode string.", "$.q.url_encode()")),
         "url_decode"   => Some(("url_decode() → string", "Percent-decode string.", "$.q.url_decode()")),
+        "to_base64"    => Some(("to_base64() → string", "Base64 encode string.", "$.payload.to_base64()")),
+        "from_base64"  => Some(("from_base64() → string", "Decode base64 string.", "$.token.from_base64()")),
         "html_escape"   => Some(("html_escape() → string", "Escape HTML entities.", "$.text.html_escape()")),
         "html_unescape" => Some(("html_unescape() → string", "Unescape HTML entities.", "$.text.html_unescape()")),
         "from_json" => Some(("from_json() → any", "Parse JSON string.", "$.payload.from_json()")),
@@ -915,7 +974,7 @@ fn method_doc(name: &str) -> String {
         "to_string" => Some(("to_string() → string", "Stringify value.", "$.n.to_string()")),
         "to_csv"    => Some(("to_csv() → string", "Encode array of records as CSV.", "$.rows.to_csv()")),
         "to_tsv"    => Some(("to_tsv() → string", "Encode array of records as TSV.", "$.rows.to_tsv()")),
-        "implode" => Some(("implode(sep) → string", "Join array of strings (alias of join).", "$.words.implode(\" \")")),
+        "implode" => Some(("implode(sep) → string", "Join array of strings.", "$.words.implode(\" \")")),
 
         // ── case conversion ─────────────────────────────────────────────────
         "camel_case"  => Some(("camel_case() → string",  "Convert to camelCase.",  "$.field.camel_case()  // \"user_id\" -> \"userId\"")),
@@ -934,7 +993,6 @@ fn method_doc(name: &str) -> String {
         "bytes"     => Some(("bytes() → [int]",      "Array of byte values.",        "$.s.bytes()")),
         "chars_of"  => Some(("chars_of(set) → int",  "Count chars from given set.",  "$.s.chars_of(\"aeiou\")")),
         "center"    => Some(("center(n, [ch]) → string", "Center-pad to width n.",   "$.s.center(20)")),
-        "repeat_str" => Some(("repeat_str(n) → string", "Repeat string n times (alias of repeat).", "$.s.repeat_str(3)")),
         "reverse_str" => Some(("reverse_str() → string", "Reverse character order.", "$.s.reverse_str()")),
 
         // ── regex variants ─────────────────────────────────────────────────
@@ -953,7 +1011,7 @@ fn method_doc(name: &str) -> String {
         "parse_bool"  => Some(("parse_bool() → bool",           "Parse \"true\"/\"false\" / yes/no.","$.flag.parse_bool()")),
 
         // ── indices / search on arrays ─────────────────────────────────────
-        "index"        => Some(("index(i) → any",            "Element at index (negative wraps from end; alias of nth).", "$.items.index(-1)")),
+        "index"        => Some(("index(i) → any",            "Element at index (negative wraps from end).", "$.items.index(-1)")),
         "find_index"   => Some(("find_index(pred) → int",    "Index of first match, or -1.",                              "$.users.find_index(.id == 42)")),
         "indices_of"   => Some(("indices_of(x) → [int]",     "All indices where element equals x.",                       "$.tags.indices_of(\"draft\")")),
         "indices_where"=> Some(("indices_where(pred) → [int]","All indices satisfying pred.",                              "$.nums.indices_where(@ < 0)")),
