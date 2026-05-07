@@ -18,6 +18,20 @@ Interactive split-pane TUI for [jetro](https://github.com/mitghi/jetro) — past
 
 ## Install
 
+### Homebrew (macOS / Linux)
+
+```sh
+brew tap mitghi/jetrocli https://github.com/mitghi/homebrew-jetrocli
+brew install jetrocli
+```
+
+### Shell installer
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/mitghi/jetrocli/releases/latest/download/jetrocli-installer.sh | sh
+```
+
+### From source
 
 ```sh
 git clone https://github.com/mitghi/jetrocli
