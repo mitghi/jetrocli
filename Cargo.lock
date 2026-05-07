@@ -510,9 +510,9 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jetro-core"
-version = "0.5.2"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fd9344e76d5f77b957a507655404f991b60718f2c15e49a55d041bb74f4182c"
+checksum = "852bf8a1df027337f58ffe6f782036f08d9e9d4813c22f15a5de16f7ae9716f8"
 dependencies = [
  "indexmap",
  "itoa",

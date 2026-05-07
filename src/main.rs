@@ -72,6 +72,7 @@ struct App<'a> {
     popup_open:  bool,
     candidates:  Vec<Candidate>,
     popup_state: ListState,
+    autocomplete_enabled: bool,
 
     chord:       Option<char>,
 
@@ -132,6 +133,7 @@ impl<'a> App<'a> {
             popup_open: false,
             candidates: vec![],
             popup_state: ListState::default(),
+            autocomplete_enabled: true,
             chord: None,
             search: None,
             palette: None,
@@ -197,6 +199,11 @@ impl<'a> App<'a> {
     }
 
     fn refresh_completions(&mut self) {
+        if !self.autocomplete_enabled {
+            self.candidates = vec![];
+            self.popup_state.select(None);
+            return;
+        }
         let expr = self.expr_text();
         let cursor_byte = expr_cursor_byte(&self.expr_area, &expr);
         let Some(doc) = &self.parsed_doc else {
@@ -348,7 +355,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
 
 fn draw_help_popup(frame: &mut Frame, size: Rect) {
     let w = 78u16.min(size.width.saturating_sub(4));
-    let h = 28u16.min(size.height.saturating_sub(2));
+    let h = 44u16.min(size.height.saturating_sub(2));
     let x = size.x + (size.width.saturating_sub(w)) / 2;
     let y = size.y + (size.height.saturating_sub(h)) / 2;
     let area = Rect { x, y, width: w, height: h };
@@ -395,6 +402,7 @@ fn draw_help_popup(frame: &mut Frame, size: Rect) {
         row(vec![key("C-n"), key("C-p")],"navigate"),
         row(vec![key("⏎"), key("Tab")],  "accept"),
         row(vec![key("C-g"), key("Esc")],"close"),
+        row(vec![key("M-g i")],          "toggle autocomplete on / off"),
         Line::from(""),
         hd("Search & commands"),
         row(vec![key("C-s"), key("C-r")],"isearch forward / backward (repeat to advance)"),
@@ -1306,6 +1314,24 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(
             continue;
         }
 
+        // chord resolution: last key was M-g
+        if app.chord == Some('g') {
+            app.chord = None;
+            // C-g cancels chord
+            if ctrl && matches!(key.code, KeyCode::Char('g')) { continue; }
+            // M-g i → toggle autocomplete
+            if matches!(key.code, KeyCode::Char('i')) {
+                app.autocomplete_enabled = !app.autocomplete_enabled;
+                if !app.autocomplete_enabled {
+                    app.popup_open = false;
+                    app.candidates.clear();
+                    app.popup_state.select(None);
+                }
+                continue;
+            }
+            continue;
+        }
+
         // chord resolution: last key was C-x
         if app.chord == Some('x') {
             app.chord = None;
@@ -1330,6 +1356,11 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(
         }
         if ctrl && matches!(key.code, KeyCode::Char('x')) && !app.popup_open {
             app.chord = Some('x');
+            continue;
+        }
+        // M-g begins chord (e.g. M-g i toggles autocomplete)
+        if alt && matches!(key.code, KeyCode::Char('g')) {
+            app.chord = Some('g');
             continue;
         }
 
@@ -1639,6 +1670,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("toggle-regex",      "Toggle regex mode in next search"),
     ("toggle-word",       "Toggle word (literal) mode in next search"),
     ("focus-next",        "Cycle pane focus"),
+    ("toggle-autocomplete","Enable / disable expr completion popup"),
     ("quit",              "Exit jetrocli"),
 ];
 
@@ -1777,6 +1809,14 @@ fn run_command(app: &mut App, name: &str) -> bool {
                 Focus::Expr   => Focus::Result,
                 Focus::Result => Focus::Json,
             };
+        }
+        "toggle-autocomplete" => {
+            app.autocomplete_enabled = !app.autocomplete_enabled;
+            if !app.autocomplete_enabled {
+                app.popup_open = false;
+                app.candidates.clear();
+                app.popup_state.select(None);
+            }
         }
         "quit" => return true,
         _ => {}
