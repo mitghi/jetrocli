@@ -3,6 +3,7 @@
 mod completion;
 mod editor;
 mod eval;
+mod pipe;
 mod shape;
 mod theme;
 
@@ -24,6 +25,7 @@ use ratatui::{
 };
 use regex::Regex;
 use serde_json::Value;
+use std::io::IsTerminal;
 use std::{collections::HashMap, fs, io, path::PathBuf, time::Duration};
 use tui_textarea::TextArea;
 
@@ -39,11 +41,17 @@ use theme::{
 #[derive(Parser, Debug)]
 #[command(name = "jetrocli", version)]
 struct Cli {
+    /// Jetro expression. When stdin is piped/redirected, evaluation runs in
+    /// non-interactive batch mode (no TUI) using a fast `from_bytes` path.
+    /// Otherwise, this just pre-fills the expression input.
+    #[arg(value_name = "EXPR")]
+    expr_pos: Option<String>,
+
     /// Load this JSON file into the left pane at startup.
     #[arg(short, long)]
     input: Option<PathBuf>,
 
-    /// Pre-fill the expression input.
+    /// Pre-fill the expression input (alternative to the positional EXPR).
     #[arg(short, long)]
     expr: Option<String>,
 
@@ -2086,6 +2094,21 @@ fn popup_move(app: &mut App, delta: i32) {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    let expr_seed = cli
+        .expr_pos
+        .clone()
+        .or_else(|| cli.expr.clone())
+        .unwrap_or_default();
+
+    // Pipe / batch mode: stdin is not a TTY (piped or redirected). Skip the
+    // TUI entirely and run a single evaluation through the fast `from_bytes`
+    // path. mmap'd when stdin is backed by a regular file.
+    if !io::stdin().is_terminal() {
+        let code = pipe::run(&expr_seed)?;
+        std::process::exit(code);
+    }
+
     init_palette(cli.theme);
 
     let json_seed = match cli.input {
@@ -2093,8 +2116,6 @@ fn main() -> Result<()> {
             .map_err(|e| anyhow!("read {}: {}", p.display(), e))?,
         None    => r#"{"store":{"books":[{"title":"Dune","price":12.99},{"title":"Foundation","price":9.99}]}}"#.to_string(),
     };
-
-    let expr_seed = cli.expr.unwrap_or_default();
 
     let mut app = App::new(json_seed, expr_seed);
     run(&mut app)?;

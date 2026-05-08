@@ -43,11 +43,33 @@ Binary lands at `target/release/jetrocli`.
 
 ## Usage
 
+### Interactive TUI
+
+Default when stdin is a TTY.
+
 ```sh
 jetrocli                            # sample document
 jetrocli -i data.json               # load from file
 jetrocli -i data.json -e '$.users'  # pre-fill expression
 ```
+
+### Pipe / batch mode
+
+When stdin is piped or redirected, TUI is skipped — jetrocli evaluates the expression against stdin and prints the result with `jq`-style colorized JSON (ANSI dropped when stdout not a TTY; respects `NO_COLOR` and `JETROCLI_COLOR=never`).
+
+```sh
+echo '{"users":[{"name":"a"},{"name":"b"}]}' | jetrocli '$.users.name'
+curl -s api.example.com/data | jetrocli '$.items.first()'
+```
+
+With no expression (or empty string), jetrocli just pretty-prints stdin as JSON, like `jq` with no filter:
+
+```sh
+cat data.json | jetrocli
+echo '{"a":1,"b":[2,3]}' | jetrocli ''
+```
+
+When stdin is backed by a regular file (`jetrocli EXPR < big.json`), input is `mmap`'d instead of streamed — zero-copy load for large documents. Real pipes fall back to a buffered read.
 
 ## License
 
