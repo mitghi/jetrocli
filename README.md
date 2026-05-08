@@ -6,6 +6,8 @@
 
 Interactive split-pane TUI for [jetro](https://github.com/mitghi/jetro) — paste JSON, write expressions, see results live. Built on `ratatui` + `crossterm`.
 
+New to jetro? [**jetro-book**](https://mitghi.github.io/jetro-book/) is the best place to start — guide, tour, and documentation for learning the expression language.
+
 ## Features
 
 - **Live evaluation** — expression re-runs on every keystroke.
