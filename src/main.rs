@@ -11,8 +11,7 @@ use anyhow::{anyhow, Result};
 use clap::Parser;
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
-        EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -26,7 +25,7 @@ use ratatui::{
 use regex::Regex;
 use serde_json::Value;
 use std::io::IsTerminal;
-use std::{collections::HashMap, fs, io, path::PathBuf, time::Duration};
+use std::{collections::HashMap, fs, io, path::PathBuf, time::{Duration, Instant}};
 use tui_textarea::TextArea;
 
 use completion::{Candidate, CandKind};
@@ -62,6 +61,8 @@ struct Cli {
 
 enum Focus { Json, Expr, Result }
 
+const EVAL_DEBOUNCE: Duration = Duration::from_millis(400);
+
 struct App<'a> {
     json:        JsonEditor,
     expr_area:   TextArea<'a>,
@@ -85,6 +86,10 @@ struct App<'a> {
     chord:       Option<char>,
 
     eval_count:  u64,
+
+    /// Debounced eval trigger: set on text edits, fired after EVAL_DEBOUNCE
+    /// elapses with no further edits.
+    pending_eval: Option<Instant>,
 
     search:      Option<SearchState>,
     palette:     Option<PaletteState>,
@@ -147,6 +152,7 @@ impl<'a> App<'a> {
             palette: None,
             help_open: false,
             eval_count: 0,
+            pending_eval: None,
         };
         app.reparse_json();
         app.evaluate();
@@ -180,6 +186,21 @@ impl<'a> App<'a> {
     fn evaluate(&mut self) {
         let expr = self.expr_text();
         self.eval.submit_expr(expr);
+        self.pending_eval = None;
+    }
+
+    /// Mark eval as pending; main loop fires it after EVAL_DEBOUNCE elapses
+    /// with no further edits.
+    fn schedule_eval(&mut self) {
+        self.pending_eval = Some(Instant::now());
+    }
+
+    /// Fire pending eval if debounce window elapsed. Returns whether anything fired.
+    fn flush_pending_eval(&mut self) -> bool {
+        match self.pending_eval {
+            Some(t) if t.elapsed() >= EVAL_DEBOUNCE => { self.evaluate(); true }
+            _ => false,
+        }
     }
 
     /// Apply a result delivered by the eval worker.
@@ -408,7 +429,7 @@ fn draw_help_popup(frame: &mut Frame, size: Rect) {
         hd("Completion popup (expr)"),
         row(vec![key("C-␣")],            "open / close popup"),
         row(vec![key("C-n"), key("C-p")],"navigate"),
-        row(vec![key("⏎"), key("Tab")],  "accept"),
+        row(vec![key("Tab")],            "accept"),
         row(vec![key("C-g"), key("Esc")],"close"),
         row(vec![key("M-g i")],          "toggle autocomplete on / off"),
         Line::from(""),
@@ -421,6 +442,7 @@ fn draw_help_popup(frame: &mut Frame, size: Rect) {
         hd("Buffer ops"),
         row(vec![key("C-c C-f")],        "format buffer (JSON / expr)"),
         row(vec![key("C-c C-k")],        "clear buffer"),
+        row(vec![key("M-k")],            "wipe focused buffer"),
         row(vec![key("C-x C-s")],        "copy buffer to clipboard (OSC 52)"),
         row(vec![key("C-c h")],          "this help"),
         Line::from(""),
@@ -1148,7 +1170,7 @@ fn highlight_json_spans(line: &str) -> Vec<Span<'static>> {
 fn run<'a>(app: &mut App<'a>) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -1158,7 +1180,6 @@ fn run<'a>(app: &mut App<'a>) -> Result<()> {
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
-        DisableMouseCapture,
         DisableBracketedPaste,
     )?;
     terminal.show_cursor()?;
@@ -1168,6 +1189,9 @@ fn run<'a>(app: &mut App<'a>) -> Result<()> {
 fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
     let mut dirty = true;
     loop {
+        // Fire debounced eval if user paused typing for EVAL_DEBOUNCE.
+        if app.flush_pending_eval() { dirty = true; }
+
         // Drain any results delivered by the eval worker since last redraw.
         while let Some(r) = app.eval.poll_latest() {
             app.apply_eval_result(r);
@@ -1179,7 +1203,15 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(
             dirty = false;
         }
 
-        if !event::poll(Duration::from_millis(40))? {
+        // Poll budget: if eval pending, cap wait so we fire on time.
+        let wait = match app.pending_eval {
+            Some(t) => {
+                let remain = EVAL_DEBOUNCE.saturating_sub(t.elapsed());
+                remain.min(Duration::from_millis(40)).max(Duration::from_millis(1))
+            }
+            None => Duration::from_millis(40),
+        };
+        if !event::poll(wait)? {
             continue;
         }
 
@@ -1198,7 +1230,7 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(
                     }
                     Focus::Result => { /* read-only */ }
                 }
-                app.evaluate();
+                app.schedule_eval();
                 dirty = true;
                 continue;
             }
@@ -1412,7 +1444,7 @@ fn handle_json(app: &mut App, key: KeyEvent) -> Result<()> {
             KeyCode::Char('k') => {
                 app.json.kill_line();
                 app.reparse_json();
-                app.evaluate();
+                app.schedule_eval();
                 return Ok(());
             }
             KeyCode::Char('v') => { app.json.page_down(&folds); return Ok(()); }
@@ -1424,6 +1456,12 @@ fn handle_json(app: &mut App, key: KeyEvent) -> Result<()> {
             KeyCode::Char('f') => { json_move_word(&mut app.json, true);  return Ok(()); }
             KeyCode::Char('b') => { json_move_word(&mut app.json, false); return Ok(()); }
             KeyCode::Char('v') | KeyCode::Char('c') => { app.json.page_up(&folds); return Ok(()); }
+            KeyCode::Char('k') => {
+                app.json = JsonEditor::from_text("");
+                app.reparse_json();
+                app.schedule_eval();
+                return Ok(());
+            }
             _ => {}
         }
     }
@@ -1448,7 +1486,7 @@ fn handle_json(app: &mut App, key: KeyEvent) -> Result<()> {
     }
     if dirty {
         app.reparse_json();
-        app.evaluate();
+        app.schedule_eval();
     }
     Ok(())
 }
@@ -1897,6 +1935,11 @@ fn handle_result(app: &mut App, key: KeyEvent) -> Result<()> {
             KeyCode::Char('f') => { json_move_word(&mut app.result, true);  return Ok(()); }
             KeyCode::Char('b') => { json_move_word(&mut app.result, false); return Ok(()); }
             KeyCode::Char('v') | KeyCode::Char('c') => { app.result.page_up(&folds); return Ok(()); }
+            KeyCode::Char('k') => {
+                app.eval_state = EvalState::Empty;
+                app.result = JsonEditor::from_text("");
+                return Ok(());
+            }
             _ => {}
         }
     }
@@ -1950,6 +1993,17 @@ fn reformat_json(app: &mut App) {
 
 fn handle_expr(app: &mut App, key: KeyEvent) -> Result<()> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt  = key.modifiers.contains(KeyModifiers::ALT);
+
+    // M-k: wipe expression buffer
+    if alt && matches!(key.code, KeyCode::Char('k')) {
+        app.expr_area.select_all();
+        app.expr_area.cut();
+        app.popup_open = false;
+        app.candidates.clear();
+        app.schedule_eval();
+        return Ok(());
+    }
 
     // popup navigation (only while open)
     if app.popup_open {
@@ -1960,7 +2014,6 @@ fn handle_expr(app: &mut App, key: KeyEvent) -> Result<()> {
             KeyCode::Up    => { popup_move(app, -1); return Ok(()); }
             KeyCode::Down  => { popup_move(app,  1); return Ok(()); }
             KeyCode::Esc   => { app.popup_open = false; return Ok(()); }
-            KeyCode::Enter => { app.accept_completion(); return Ok(()); }
             KeyCode::Tab   => { app.accept_completion(); return Ok(()); }
             _ => {}
         }
@@ -1992,7 +2045,7 @@ fn handle_expr(app: &mut App, key: KeyEvent) -> Result<()> {
     app.expr_area.input(key);
     app.refresh_completions();
     app.popup_open = !app.candidates.is_empty();
-    app.evaluate();
+    app.schedule_eval();
     Ok(())
 }
 
