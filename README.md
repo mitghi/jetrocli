@@ -73,6 +73,25 @@ echo '{"a":1,"b":[2,3]}' | jetrocli ''
 
 When stdin is backed by a regular file (`jetrocli EXPR < big.json`), input is `mmap`'d instead of streamed — zero-copy load for large documents. Real pipes fall back to a buffered read.
 
+### NDJSON mode (file-only)
+
+`--ndjson` switches jetrocli into newline-delimited JSON batch mode: one JSON document per line in `-i <FILE>`, expression evaluated independently per row, one compact result per output line. File input only.
+
+```sh
+jetrocli --ndjson -i events.ndjson '$.user'
+jetrocli --ndjson -i events.ndjson --limit 100 '$.level == "error"'
+jetrocli --ndjson -i app.log -r '$.msg'                    # tail → head
+jetrocli --ndjson -i app.log -r --limit 50 '$.msg'         # last 50 matches
+```
+
+| Flag | Effect |
+| --- | --- |
+| `--ndjson` | Enable NDJSON mode. Requires `-i <FILE>` and a non-empty expression. |
+| `-r`, `--reverse` | Read file from tail to head via mmap. Requires `--ndjson`. |
+| `--limit <N>` | Stop after `N` emitted rows. Requires `--ndjson` and `N ≥ 1`. |
+| `--max-line-bytes <BYTES>` | Per-line byte cap. Default 64 MiB. |
+| `--reverse-chunk <BYTES>` | Reverse reader chunk size. Tune for very wide rows. |
+
 ## License
 
 MIT

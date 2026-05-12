@@ -3,6 +3,7 @@
 mod completion;
 mod editor;
 mod eval;
+mod ndjson;
 mod pipe;
 mod shape;
 mod theme;
@@ -57,6 +58,27 @@ struct Cli {
     /// Color theme.
     #[arg(long, value_enum, default_value_t = ThemeArg::Dark)]
     theme: ThemeArg,
+
+    /// Treat -i as an NDJSON file (one JSON document per line). Evaluates EXPR
+    /// per row and writes one compact result per output line. File input only.
+    #[arg(long)]
+    ndjson: bool,
+
+    /// Read the NDJSON file from tail to head. Requires --ndjson.
+    #[arg(short = 'r', long)]
+    reverse: bool,
+
+    /// Stop after emitting N rows. Requires --ndjson.
+    #[arg(long, value_name = "N")]
+    limit: Option<usize>,
+
+    /// Maximum bytes per NDJSON line. Defaults to 64 MiB.
+    #[arg(long, value_name = "BYTES")]
+    max_line_bytes: Option<usize>,
+
+    /// Chunk size (bytes) used by the reverse NDJSON reader.
+    #[arg(long, value_name = "BYTES")]
+    reverse_chunk: Option<usize>,
 }
 
 enum Focus { Json, Expr, Result }
@@ -2147,6 +2169,12 @@ fn popup_move(app: &mut App, delta: i32) {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // NDJSON file-mode short-circuits both TUI and stdin pipe paths.
+    if cli.ndjson {
+        let code = ndjson::run(&cli)?;
+        std::process::exit(code);
+    }
 
     let expr_seed = cli
         .expr_pos
