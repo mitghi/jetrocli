@@ -1,6 +1,6 @@
 [package]
 name = "jetrocli"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2021"
 description = "Interactive split-pane TUI for jetro: paste JSON, do live query"
 license = "MIT"
