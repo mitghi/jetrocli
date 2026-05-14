@@ -21,12 +21,6 @@ pub fn run(cli: &Cli) -> Result<i32> {
     if matches!(cli.limit, Some(0)) {
         return Err(anyhow!("--limit must be >= 1"));
     }
-    if cli.distinct_by.is_some() && (!cli.reverse || cli.limit.is_none()) {
-        return Err(anyhow!(
-            "--distinct-by requires --ndjson --reverse --limit <N>"
-        ));
-    }
-
     let expr = cli
         .expr_pos
         .clone()
@@ -48,13 +42,11 @@ pub fn run(cli: &Cli) -> Result<i32> {
     let stdout = io::stdout();
     let out = BufWriter::new(stdout.lock());
 
-    let result = match (cli.reverse, cli.limit, cli.distinct_by.as_deref()) {
-        (false, None, None) => run_forward(&engine, path, &expr, opts, out),
-        (false, Some(n), None) => run_forward_limited(&engine, path, &expr, opts, out, n),
-        (true, None, None) => run_reverse(&engine, path, &expr, opts, out),
-        (true, Some(n), None) => run_reverse_limited(&engine, path, &expr, opts, out, n),
-        (true, Some(n), Some(key)) => run_reverse_distinct(&engine, path, key, &expr, opts, out, n),
-        _ => unreachable!("validated NDJSON distinct_by option combination"),
+    let result = match (cli.reverse, cli.limit) {
+        (false, None)    => run_forward(&engine, path, &expr, opts, out),
+        (false, Some(n)) => run_forward_limited(&engine, path, &expr, opts, out, n),
+        (true,  None)    => run_reverse(&engine, path, &expr, opts, out),
+        (true,  Some(n)) => run_reverse_limited(&engine, path, &expr, opts, out, n),
     };
 
     match result {
@@ -116,21 +108,6 @@ fn run_reverse_limited<W: Write>(
 ) -> Result<()> {
     engine
         .run_ndjson_rev_limit_with_options(path, expr, limit, out, opts)
-        .map(|_| ())
-        .map_err(|e| anyhow!("{}", e))
-}
-
-fn run_reverse_distinct<W: Write>(
-    engine: &JetroEngine,
-    path: &Path,
-    key_expr: &str,
-    expr: &str,
-    opts: NdjsonOptions,
-    out: W,
-    limit: usize,
-) -> Result<()> {
-    engine
-        .run_ndjson_rev_distinct_by_with_options(path, key_expr, expr, limit, out, opts)
         .map(|_| ())
         .map_err(|e| anyhow!("{}", e))
 }
