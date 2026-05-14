@@ -72,6 +72,11 @@ struct Cli {
     #[arg(long, value_name = "N")]
     limit: Option<usize>,
 
+    /// In reverse NDJSON mode, keep only the newest row for each key expression.
+    /// Requires --ndjson --reverse --limit.
+    #[arg(long, value_name = "EXPR")]
+    distinct_by: Option<String>,
+
     /// Maximum bytes per NDJSON line. Defaults to 64 MiB.
     #[arg(long, value_name = "BYTES")]
     max_line_bytes: Option<usize>,
