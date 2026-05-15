@@ -175,6 +175,5 @@ fn run_reverse_limited<W: Write>(
 }
 
 fn is_rows_stream_expr(expr: &str) -> bool {
-    let expr = expr.trim_start();
-    expr.starts_with("$.rows(") || expr.starts_with("$.rows.")
+    expr.contains("$.rows(") || expr.contains("$.rows.")
 }
