@@ -95,7 +95,7 @@ fn parse_separator(separator: &str) -> Result<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_separator;
+    use super::{is_rows_stream_expr, parse_separator};
 
     #[test]
     fn parses_payload_separator() {
@@ -103,6 +103,14 @@ mod tests {
         assert_eq!(parse_separator(r"\t").unwrap(), b'\t');
         assert_eq!(parse_separator(r"\x1f").unwrap(), 0x1f);
         assert!(parse_separator("::").is_err());
+    }
+
+    #[test]
+    fn detects_rows_stream_expression() {
+        assert!(is_rows_stream_expr("$.rows().take(1)"));
+        assert!(is_rows_stream_expr("  $.rows().reverse()"));
+        assert!(!is_rows_stream_expr("$.items.rows().take(1)"));
+        assert!(!is_rows_stream_expr("$.name"));
     }
 }
 
@@ -140,6 +148,9 @@ fn run_reverse<W: Write>(
     opts: NdjsonOptions,
     out: W,
 ) -> Result<()> {
+    if is_rows_stream_expr(expr) {
+        return run_forward(engine, path, expr, opts, out);
+    }
     engine
         .run_ndjson_rev_with_options(path, expr, out, opts)
         .map(|_| ())
@@ -154,8 +165,16 @@ fn run_reverse_limited<W: Write>(
     out: W,
     limit: usize,
 ) -> Result<()> {
+    if is_rows_stream_expr(expr) {
+        return run_forward_limited(engine, path, expr, opts, out, limit);
+    }
     engine
         .run_ndjson_rev_limit_with_options(path, expr, limit, out, opts)
         .map(|_| ())
         .map_err(|e| anyhow!("{}", e))
+}
+
+fn is_rows_stream_expr(expr: &str) -> bool {
+    let expr = expr.trim_start();
+    expr.starts_with("$.rows(") || expr.starts_with("$.rows.")
 }
