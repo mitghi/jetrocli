@@ -9,7 +9,7 @@ mod shape;
 mod theme;
 
 use anyhow::{anyhow, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use crossterm::{
     event::{
         self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
@@ -79,6 +79,22 @@ struct Cli {
     /// Chunk size (bytes) used by the reverse NDJSON reader.
     #[arg(long, value_name = "BYTES")]
     reverse_chunk: Option<usize>,
+
+    /// In NDJSON mode, treat each line as PREFIX<SEP>JSON and evaluate only
+    /// the JSON payload after SEP. SEP must be one byte, for example '|'.
+    #[arg(long, value_name = "SEP")]
+    payload_after: Option<String>,
+
+    /// Policy for framed `null` payloads when --payload-after is set.
+    #[arg(long, value_enum, default_value_t = NullPayloadArg::Skip)]
+    null_payload: NullPayloadArg,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum NullPayloadArg {
+    Skip,
+    Keep,
+    Error,
 }
 
 enum Focus { Json, Expr, Result }

@@ -4,12 +4,13 @@
 //! across rows.
 
 use anyhow::{anyhow, Result};
-use jetro_core::io::{NdjsonOptions, NdjsonSource};
+use jetro_core::io::{NdjsonOptions, NdjsonRowFrame, NdjsonSource, NullPayload};
 use jetro_core::JetroEngine;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
 use crate::Cli;
+use crate::NullPayloadArg;
 
 pub fn run(cli: &Cli) -> Result<i32> {
     let Some(path) = cli.input.as_ref() else {
@@ -20,6 +21,9 @@ pub fn run(cli: &Cli) -> Result<i32> {
     }
     if matches!(cli.limit, Some(0)) {
         return Err(anyhow!("--limit must be >= 1"));
+    }
+    if cli.payload_after.is_none() && cli.null_payload != NullPayloadArg::Skip {
+        return Err(anyhow!("--null-payload requires --payload-after"));
     }
     let expr = cli
         .expr_pos
@@ -36,6 +40,16 @@ pub fn run(cli: &Cli) -> Result<i32> {
     }
     if let Some(n) = cli.reverse_chunk {
         opts = opts.with_reverse_chunk_size(n);
+    }
+    if let Some(separator) = cli.payload_after.as_deref() {
+        opts = opts.with_row_frame(NdjsonRowFrame::DelimitedPayload {
+            separator: parse_separator(separator)?,
+            null_payload: match cli.null_payload {
+                NullPayloadArg::Skip => NullPayload::Skip,
+                NullPayloadArg::Keep => NullPayload::Keep,
+                NullPayloadArg::Error => NullPayload::Error,
+            },
+        });
     }
 
     let engine = JetroEngine::new();
@@ -55,6 +69,40 @@ pub fn run(cli: &Cli) -> Result<i32> {
             eprintln!("jetrocli: {}: {}", path.display(), e);
             Ok(1)
         }
+    }
+}
+
+fn parse_separator(separator: &str) -> Result<u8> {
+    match separator {
+        r"\t" => return Ok(b'\t'),
+        r"\n" => return Ok(b'\n'),
+        r"\r" => return Ok(b'\r'),
+        _ => {}
+    }
+    if let Some(hex) = separator.strip_prefix(r"\x") {
+        if hex.len() == 2 {
+            return u8::from_str_radix(hex, 16)
+                .map_err(|_| anyhow!("--payload-after expects one byte separator"));
+        }
+    }
+    let bytes = separator.as_bytes();
+    if bytes.len() == 1 {
+        Ok(bytes[0])
+    } else {
+        Err(anyhow!("--payload-after expects one byte separator"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_separator;
+
+    #[test]
+    fn parses_payload_separator() {
+        assert_eq!(parse_separator("|").unwrap(), b'|');
+        assert_eq!(parse_separator(r"\t").unwrap(), b'\t');
+        assert_eq!(parse_separator(r"\x1f").unwrap(), 0x1f);
+        assert!(parse_separator("::").is_err());
     }
 }
 

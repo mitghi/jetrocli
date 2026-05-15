@@ -92,6 +92,7 @@ jetrocli --ndjson -i events.ndjson '$.user'
 jetrocli --ndjson -i events.ndjson --limit 100 '$.level == "error"'
 jetrocli --ndjson -i app.log -r '$.msg'                    # tail → head
 jetrocli --ndjson -i app.log -r --limit 50 '$.msg'         # last 50 matches
+jetrocli --ndjson -i topic.log --payload-after '|' '$.id'  # key|JSON payload
 ```
 
 | Flag | Effect |
@@ -99,6 +100,8 @@ jetrocli --ndjson -i app.log -r --limit 50 '$.msg'         # last 50 matches
 | `--ndjson` | Enable NDJSON mode. Requires `-i <FILE>` and a non-empty expression. |
 | `-r`, `--reverse` | Read file from tail to head via mmap. Requires `--ndjson`. |
 | `--limit <N>` | Stop after `N` emitted rows. Requires `--ndjson` and `N ≥ 1`. |
+| `--payload-after <SEP>` | Treat each line as `prefix<SEP>JSON` and query only the JSON payload after the one-byte separator. Non-payload rows, empty payloads, and skipped null tombstones are ignored. |
+| `--null-payload <skip\|keep\|error>` | Policy for framed `null` payloads when `--payload-after` is used. Defaults to `skip`. |
 | `--max-line-bytes <BYTES>` | Per-line byte cap. Default 64 MiB. |
 | `--reverse-chunk <BYTES>` | Reverse reader chunk size. Tune for very wide rows. |
 
