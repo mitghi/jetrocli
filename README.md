@@ -95,6 +95,22 @@ jetrocli --ndjson -i app.log -r --limit 50 '$.msg'         # last 50 matches
 jetrocli --ndjson -i topic.log --payload-after '|' '$.id'  # key|JSON payload
 ```
 
+Use `$.rows()` when the expression should operate on the whole NDJSON file as one stream instead of running independently per line:
+
+```sh
+jetrocli --ndjson -i events.ndjson \
+  '$.rows().filter($.active).take(10).map({id: $.id, name: $.name})'
+```
+
+For file inputs, `$.rows().reverse()` scans from the end of the file. This is useful for logs and Kafka compacted-topic dumps where the newest record for a key is last:
+
+```sh
+jetrocli --ndjson -i events.ndjson \
+  '$.rows().reverse().distinct_by($.id).take(100).map({id: $.id, ts: $.ts})'
+```
+
+On the 1 GB benchmark described below, simple row-local projections are typically tens of times faster than jaq, and the best direct byte paths are near 100x faster. Whole-stream `$.rows()` queries keep the same mmap/direct-byte foundation, but performance depends on how much of the file must be scanned: `take(...)` and reverse latest-by-key style queries can stop early, while broad `filter`, `distinct_by`, or fallback expressions naturally pay for every row they inspect.
+
 | Flag | Effect |
 | --- | --- |
 | `--ndjson` | Enable NDJSON mode. Requires `-i <FILE>` and a non-empty expression. |
