@@ -88,25 +88,25 @@ When stdin is backed by a regular file (`jetrocli EXPR < big.json`), input is `m
 `--ndjson` switches jetrocli into newline-delimited JSON batch mode: one JSON document per line in `-i <FILE>`, expression evaluated independently per row, one compact result per output line. File input only.
 
 ```sh
-jetrocli --ndjson -i events.ndjson '$.user'
-jetrocli --ndjson -i events.ndjson --limit 100 '$.level == "error"'
-jetrocli --ndjson -i app.log -r '$.msg'                    # tail → head
-jetrocli --ndjson -i app.log -r --limit 50 '$.msg'         # last 50 matches
-jetrocli --ndjson -i topic.log --payload-after '|' '$.id'  # key|JSON payload
+jetrocli --ndjson -i events.ndjson -e '$.user'
+jetrocli --ndjson -i events.ndjson --limit 100 -e '$.level == "error"'
+jetrocli --ndjson -i app.log -r -e '$.msg'                    # tail → head
+jetrocli --ndjson -i app.log -r --limit 50 -e '$.msg'         # last 50 matches
+jetrocli --ndjson -i topic.log --payload-after '|' -e '$.id'  # key|JSON payload
 ```
 
 Use `$.rows()` when the expression should operate on the whole NDJSON file as one stream instead of running independently per line:
 
 ```sh
 jetrocli --ndjson -i events.ndjson \
-  '$.rows().filter($.active).take(10).map({id: $.id, name: $.name})'
+  -e '$.rows().filter($.active).take(10).map({id: $.id, name: $.name})'
 ```
 
 For file inputs, `$.rows().reverse()` scans from the end of the file. This is useful for logs and Kafka compacted-topic dumps where the newest record for a key is last:
 
 ```sh
 jetrocli --ndjson -i events.ndjson \
-  '$.rows().reverse().distinct_by($.id).take(100).map({id: $.id, ts: $.ts})'
+  -e '$.rows().reverse().distinct_by($.id).take(100).map({id: $.id, ts: $.ts})'
 ```
 
 On the 1 GB benchmark described below, simple row-local projections are typically tens of times faster than jaq, and the best direct byte paths are near 100x faster. Whole-stream `$.rows()` queries keep the same mmap/direct-byte foundation, but performance depends on how much of the file must be scanned: `take(...)` and reverse latest-by-key style queries can stop early, while broad `filter`, `distinct_by`, or fallback expressions naturally pay for every row they inspect.
