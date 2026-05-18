@@ -25,6 +25,7 @@ For large files, `jetrocli` can memory map regular-file input. In `--ndjson` mod
 - **Fast NDJSON scans** — `--ndjson` evaluates one JSON document per line from `-i <FILE>` and emits one compact result per row.
 - **Reverse NDJSON reads** — `--ndjson -r` scans from tail to head, useful for log-style files where the newest rows matter first.
 - **Bounded NDJSON filters** — combine `--ndjson` with `--limit <N>` to stop after the first `N` emitted rows, including reverse scans for "latest matching rows" queries.
+- **Opt-in query inspection** — `--inspect` shows how a query lowers, which plans are built, and which executors are selected without running the query.
 - **Emacs-style bindings** throughout (`C-a/C-e`, `C-f/C-b`, `M-f/M-b`, `C-n/C-p`, `C-g`, `C-c` prefix chord).
 - **Expression formatter** — breaks long jetro chains onto indented lines (`C-c C-f`).
 
@@ -111,8 +112,20 @@ jetrocli --ndjson -i events.ndjson \
 
 On the 1 GB benchmark described below, simple row-local projections are typically tens of times faster than jaq, and the best direct byte paths are near 100x faster. Whole-stream `$.rows()` queries keep the same mmap/direct-byte foundation, but performance depends on how much of the file must be scanned: `take(...)` and reverse latest-by-key style queries can stop early, while broad `filter`, `distinct_by`, or fallback expressions naturally pay for every row they inspect.
 
+### Inspection mode
+
+`--inspect` prints the query inspection tree and exits without evaluating the query. Use it to see parser/lowering context, physical plan nodes, pipeline stages, NDJSON route selection, demand, and executor choices.
+
+```sh
+jetrocli --inspect '$.items.filter(price > 10).map(name)'
+jetrocli --inspect --inspect-level plan '$.items.first()'
+jetrocli --ndjson -i events.ndjson --inspect -e '$.rows().reverse().find($.active)'
+```
+
 | Flag | Effect |
 | --- | --- |
+| `--inspect` | Print query inspection details and exit without executing the query. |
+| `--inspect-level <summary\|plan\|detailed>` | Detail level for `--inspect`. Defaults to `detailed`. |
 | `--ndjson` | Enable NDJSON mode. Requires `-i <FILE>` and a non-empty expression. |
 | `-r`, `--reverse` | Read file from tail to head via mmap. Requires `--ndjson`. |
 | `--limit <N>` | Stop after `N` emitted rows. Requires `--ndjson` and `N ≥ 1`. |

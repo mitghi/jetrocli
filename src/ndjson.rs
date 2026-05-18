@@ -34,23 +34,7 @@ pub fn run(cli: &Cli) -> Result<i32> {
         return Err(anyhow!("--ndjson requires an expression"));
     }
 
-    let mut opts = NdjsonOptions::default();
-    if let Some(n) = cli.max_line_bytes {
-        opts = opts.with_max_line_len(n);
-    }
-    if let Some(n) = cli.reverse_chunk {
-        opts = opts.with_reverse_chunk_size(n);
-    }
-    if let Some(separator) = cli.payload_after.as_deref() {
-        opts = opts.with_row_frame(NdjsonRowFrame::DelimitedPayload {
-            separator: parse_separator(separator)?,
-            null_payload: match cli.null_payload {
-                NullPayloadArg::Skip => NullPayload::Skip,
-                NullPayloadArg::Keep => NullPayload::Keep,
-                NullPayloadArg::Error => NullPayload::Error,
-            },
-        });
-    }
+    let opts = options(cli)?;
 
     let engine = JetroEngine::new();
     let stdout = io::stdout();
@@ -91,6 +75,27 @@ fn parse_separator(separator: &str) -> Result<u8> {
     } else {
         Err(anyhow!("--payload-after expects one byte separator"))
     }
+}
+
+pub(crate) fn options(cli: &Cli) -> Result<NdjsonOptions> {
+    let mut opts = NdjsonOptions::default();
+    if let Some(n) = cli.max_line_bytes {
+        opts = opts.with_max_line_len(n);
+    }
+    if let Some(n) = cli.reverse_chunk {
+        opts = opts.with_reverse_chunk_size(n);
+    }
+    if let Some(separator) = cli.payload_after.as_deref() {
+        opts = opts.with_row_frame(NdjsonRowFrame::DelimitedPayload {
+            separator: parse_separator(separator)?,
+            null_payload: match cli.null_payload {
+                NullPayloadArg::Skip => NullPayload::Skip,
+                NullPayloadArg::Keep => NullPayload::Keep,
+                NullPayloadArg::Error => NullPayload::Error,
+            },
+        });
+    }
+    Ok(opts)
 }
 
 #[cfg(test)]

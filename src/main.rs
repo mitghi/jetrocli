@@ -3,6 +3,7 @@
 mod completion;
 mod editor;
 mod eval;
+mod inspect;
 mod ndjson;
 mod pipe;
 mod shape;
@@ -88,6 +89,14 @@ struct Cli {
     /// Policy for framed `null` payloads when --payload-after is set.
     #[arg(long, value_enum, default_value_t = NullPayloadArg::Skip)]
     null_payload: NullPayloadArg,
+
+    /// Print the query inspection report and exit without executing the query.
+    #[arg(long)]
+    inspect: bool,
+
+    /// Detail level for --inspect.
+    #[arg(long, value_enum, default_value_t = InspectLevelArg::Detailed)]
+    inspect_level: InspectLevelArg,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -95,6 +104,13 @@ enum NullPayloadArg {
     Skip,
     Keep,
     Error,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum InspectLevelArg {
+    Summary,
+    Plan,
+    Detailed,
 }
 
 enum Focus { Json, Expr, Result }
@@ -2185,18 +2201,22 @@ fn popup_move(app: &mut App, delta: i32) {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let expr_seed = cli
+        .expr_pos
+        .clone()
+        .or_else(|| cli.expr.clone())
+        .unwrap_or_default();
+
+    if cli.inspect {
+        let code = inspect::run(&cli, &expr_seed)?;
+        std::process::exit(code);
+    }
 
     // NDJSON file-mode short-circuits both TUI and stdin pipe paths.
     if cli.ndjson {
         let code = ndjson::run(&cli)?;
         std::process::exit(code);
     }
-
-    let expr_seed = cli
-        .expr_pos
-        .clone()
-        .or_else(|| cli.expr.clone())
-        .unwrap_or_default();
 
     // Pipe / batch mode: stdin is not a TTY (piped or redirected). Skip the
     // TUI entirely and run a single evaluation through the fast `from_bytes`
